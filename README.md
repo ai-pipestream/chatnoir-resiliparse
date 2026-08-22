@@ -60,6 +60,68 @@ compressed and uncompressed WARC/1.0 and WARC/1.1 streams. Supported compression
 Main documentation: [FastWARC](https://resiliparse.chatnoir.eu/en/latest/man/fastwarc.html)
 and [FastWARC CLI](https://resiliparse.chatnoir.eu/en/latest/man/fastwarc-cli.html)
 
+## gRPC server (this fork)
+
+This is the `ai-pipestream` fork of chatnoir-resiliparse. It does not change
+Resiliparse or FastWARC themselves; it adds one thing upstream does not have:
+a streaming gRPC server, `fastwarc-grpc/`, that puts the `fastwarc` Rust WARC
+parser behind a `fastwarc.v1.WarcService` gRPC interface. The server is pure
+Rust with no Python/Cython in the path, and depends on the `fastwarc` crate
+only through a normal path dependency, so the parser itself stays untouched.
+
+At the time of writing this crate lives on this fork's `fastwarc-grpc-parallel`
+branch and has not yet been merged into `develop`; nothing below is upstream
+ChatNoir/Webis content.
+
+`WarcService` exposes two RPCs over the same parse pipeline:
+
+- `ParseWarc` (bidirectional streaming): the client sends one `config`
+  message followed by archive bytes as `chunk` messages (plain, or gzip/zstd/
+  lz4-compressed, auto-detected from magic bytes). The server streams back,
+  per kept record, a `record_start` (full lossless header metadata), zero or
+  more `payload_chunk` messages, and a `record_end` (payload length, digest
+  verification). A bad HTTP sub-parse yields a recoverable `record_error`;
+  a broken WARC framing yields a non-recoverable one and ends the stream.
+- `ParseArchive` (unary): the whole archive in one request, every kept
+  record (metadata, full payload, digest status) in one response, for
+  archives that fit inside the gRPC message size limit.
+
+```mermaid
+flowchart LR
+    Client["gRPC client"]
+
+    subgraph Server["fastwarc-grpc server (fastwarc.v1.WarcService)"]
+        direction LR
+        RPC["ParseWarc / ParseArchive"]
+        Parser["FastWARC parser\n(ArchiveIterator, Rust)"]
+        RPC --> Parser
+    end
+
+    Client -- "stream: config + chunk\n(warc / .gz / .zst / .lz4)" --> RPC
+    Parser -- "record_start\n(headers, metadata)" --> Client
+    Parser -- "payload_chunk*\n(offset-tagged bytes)" --> Client
+    Parser -- "record_end\n(digest status)" --> Client
+    Parser -. "record_error\n(recoverable or fatal)" .-> Client
+```
+
+Other notable details, mostly relevant to operators:
+
+- `ParseWarcConfig.archive_path` lets the server open a local file instead
+  of accepting uploaded bytes; it is rejected with `PERMISSION_DENIED`
+  unless the server opts in (`FASTWARC_GRPC_ALLOW_LOCAL_FILES=1`), since it
+  otherwise grants any client read access to the server's filesystem.
+- `parallelism` (config field, `ParseWarc` only) cuts a gzip-per-record
+  archive at validated member boundaries and parses segments on multiple
+  workers; records then arrive interleaved and are correlated by
+  `record_index` rather than file order.
+- `grpc.health.v1.Health` and gRPC server reflection (v1) are both served,
+  so `grpcurl` can introspect and call `WarcService` without local copies
+  of the `.proto` files.
+
+See `fastwarc-grpc/README.md` and `fastwarc-grpc/DESIGN.md` (on the
+`fastwarc-grpc-parallel` branch) for the full protocol reference, the
+lossless WARC-to-protobuf field mapping, and build/run instructions.
+
 ## Installation (Rust)
 
 To use FastWARC as a library in your Rust project, add the following to your `Cargo.toml`:
