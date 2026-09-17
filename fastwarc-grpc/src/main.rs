@@ -20,7 +20,9 @@ use std::path::{Path, PathBuf};
 use fastwarc_grpc::proto;
 use fastwarc_grpc::proto::fastwarc::v1::warc_service_server::WarcServiceServer;
 use fastwarc_grpc::warc_service::WarcParser;
+#[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(unix)]
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 
@@ -55,20 +57,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if allow_local_files { "allowed" } else { "disabled" }
     );
 
-    if let Some(path) = unix_socket_path(&addr) {
-        let _ = std::fs::remove_file(&path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+    match unix_socket_path(&addr) {
+        #[cfg(unix)]
+        Some(path) => {
+            remove_stale_socket(&path)?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let listener = UnixListener::bind(&path)?;
+            builder
+                .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown_signal())
+                .await?;
+            let _ = std::fs::remove_file(&path);
         }
-        let listener = UnixListener::bind(&path)?;
-        builder
-            .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown_signal())
-            .await?;
-        let _ = std::fs::remove_file(&path);
-    } else {
-        builder.serve_with_shutdown(addr.parse()?, shutdown_signal()).await?;
+        #[cfg(not(unix))]
+        Some(path) => {
+            return Err(format!(
+                "unix domain socket address {} is not supported on this platform; \
+                 set FASTWARC_GRPC_ADDR to a TCP address such as [::]:50061",
+                path.display()
+            )
+            .into());
+        }
+        None => {
+            builder.serve_with_shutdown(addr.parse()?, shutdown_signal()).await?;
+        }
     }
     Ok(())
+}
+
+/// Removes a leftover socket file so the listener can rebind, refusing to
+/// delete anything that is not a unix socket.
+#[cfg(unix)]
+fn remove_stale_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} already exists and is not a unix socket", path.display()),
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// `unix:///path`, `unix:/path`, or an absolute filesystem path.
