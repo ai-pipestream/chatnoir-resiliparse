@@ -46,6 +46,11 @@
 //! client must use compatible encode and decode limits. One request carries the configuration and
 //! complete archive; the response carries the parsed records and errors.
 //!
+//! The request limit only bounds the compressed archive, so the server also budgets the decoded
+//! response at 16 MiB ([`defaults::MAX_UNARY_RESPONSE_SIZE`]): an archive whose collected records
+//! (payload bytes plus encoded metadata and errors) exceed that budget fails with
+//! `ResourceExhausted`. Use the streaming `ParseWarc` RPC for such archives.
+//!
 //! ```no_run
 //! use fastwarc_grpc::proto::fastwarc::v1 as pb;
 //! use fastwarc_grpc::proto::fastwarc::v1::warc_service_client::WarcServiceClient;

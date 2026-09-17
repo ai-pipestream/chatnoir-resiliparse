@@ -28,7 +28,10 @@ Usage documentation with worked client examples lives in the crate docs:
   request, every kept record (metadata and whole payload) in
   one response, for single records and small archives within the gRPC
   message size limits (this server accepts 16 MiB; many clients default to
-  4 MiB). Same parse pipeline, filters, and error model as the stream; a
+  4 MiB). Because the request limit only bounds the compressed archive, the
+  decoded response is budgeted at 16 MiB as well; archives that decode past
+  it fail with `RESOURCE_EXHAUSTED` and must use `ParseWarc`. Same parse
+  pipeline, filters, and error model as the stream; a
   framing error returns the records parsed so far plus one non-recoverable
   error.
 - `include_payload` / `include_headers` default to true. Set false to skip
