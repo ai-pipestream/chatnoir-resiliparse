@@ -30,7 +30,10 @@ use self::batch::BatchEmitter;
 use self::channel_reader::ChannelReader;
 use self::parser::{parse_into, record_error};
 use crate::convert;
-use crate::defaults::{DEFAULT_INPUT_BUFFER_SIZE, MAX_HEADER_LEN, MAX_INPUT_BUFFER_SIZE, MAX_PAYLOAD_CHUNK_SIZE};
+use crate::defaults::{
+    DEFAULT_INPUT_BUFFER_SIZE, MAX_HEADER_LEN, MAX_INPUT_BUFFER_SIZE, MAX_PAYLOAD_CHUNK_SIZE,
+    MAX_UNARY_RESPONSE_SIZE,
+};
 use crate::proto::fastwarc::v1 as pb;
 
 const CHUNK_CHANNEL_BOUND: usize = 8;
@@ -110,7 +113,7 @@ impl pb::warc_service_server::WarcService for WarcParser {
         let archive = request.archive;
         let joined = tokio::task::spawn_blocking(move || collect_archive(io::Cursor::new(archive), &config)).await;
         match joined {
-            Ok(response) => Ok(Response::new(response)),
+            Ok(response) => Ok(Response::new(response?)),
             Err(error) if error.is_panic() => Err(Status::internal("WARC parser task panicked")),
             Err(_) => Err(Status::cancelled("WARC parser task cancelled")),
         }
@@ -232,16 +235,46 @@ fn run_parser(input: ParserInput, response_tx: &ResponseSender, config: &pb::Par
 fn collect_archive(
     reader: impl fastwarc::stream_io::traits::IntoWarcReader,
     config: &pb::ParseWarcConfig,
-) -> pb::ParseArchiveResponse {
+) -> Result<pb::ParseArchiveResponse, Status> {
     let mut records = Vec::new();
     let mut errors = Vec::new();
     let mut open: Option<pb::ParsedRecord> = None;
-    let mut emit = |response| {
+    // The request cap only bounds the compressed archive. Meter what the
+    // response accumulates so a small request cannot decode into an
+    // arbitrarily large in-memory response, and stop parsing at the budget.
+    let mut collected: usize = 0;
+    let mut emit = |response: pb::ParseWarcResponse| {
+        collected = collected.saturating_add(event_size(&response));
+        if collected > MAX_UNARY_RESPONSE_SIZE {
+            return false;
+        }
         fold_response(response, &mut open, &mut records, &mut errors);
         true
     };
     parse_into(reader, config, &mut emit);
-    pb::ParseArchiveResponse { records, errors }
+    if collected > MAX_UNARY_RESPONSE_SIZE {
+        return Err(Status::resource_exhausted(format!(
+            "archive decodes past the {MAX_UNARY_RESPONSE_SIZE}-byte ParseArchive response budget; \
+             use the streaming ParseWarc RPC for large archives"
+        )));
+    }
+    Ok(pb::ParseArchiveResponse { records, errors })
+}
+
+/// Bytes an event adds to the collected unary response: payload bytes plus
+/// the encoded size of record metadata and errors. `record_end` closes a
+/// sequence without adding data.
+fn event_size(response: &pb::ParseWarcResponse) -> usize {
+    use prost::Message;
+    match &response.kind {
+        Some(pb::parse_warc_response::Kind::RecordStart(start)) => {
+            start.metadata.as_ref().map_or(0, Message::encoded_len)
+        }
+        Some(pb::parse_warc_response::Kind::PayloadChunk(chunk)) => chunk.data.len(),
+        Some(pb::parse_warc_response::Kind::RecordError(error)) => error.encoded_len(),
+        Some(pb::parse_warc_response::Kind::Batch(batch)) => batch.items.iter().map(event_size).sum(),
+        Some(pb::parse_warc_response::Kind::RecordEnd(_)) | None => 0,
+    }
 }
 
 fn fold_response(

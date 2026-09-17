@@ -51,7 +51,11 @@ service WarcService {
 
   // ParseArchive parses an archive carried in one request and returns records
   // and errors in separate lists. Each list preserves archive order. It is
-  // intended for inputs that fit within the gRPC message size limit.
+  // intended for inputs that fit within the gRPC message size limit. The
+  // request limit only bounds the compressed archive, so the server also
+  // budgets the decoded response (payload bytes plus encoded metadata and
+  // errors) at 16 MiB and fails with RESOURCE_EXHAUSTED when an archive
+  // decodes past it. Use ParseWarc for larger archives.
   rpc ParseArchive(ParseArchiveRequest) returns (ParseArchiveResponse);
 }
 

@@ -761,6 +761,45 @@ async fn unary_empty_archive() {
     assert!(response.errors.is_empty());
 }
 
+/// The gRPC request cap only bounds the compressed archive, so a small
+/// gzipped request whose records decode past the unary response budget must
+/// fail with `ResourceExhausted` instead of collecting the oversized
+/// response in memory.
+#[tokio::test]
+async fn unary_rejects_oversized_decoded_archive() {
+    use std::io::Write;
+
+    // One record whose payload alone exceeds the response budget. The zeros
+    // compress to a few KiB, far below the 16 MiB request message limit.
+    let payload_len = fastwarc_grpc::defaults::MAX_UNARY_RESPONSE_SIZE + (1 << 20);
+    let mut archive = Vec::with_capacity(payload_len + 512);
+    write!(
+        archive,
+        "WARC/1.0\r\nWARC-Type: resource\r\nWARC-Record-ID: <urn:uuid:33333333-3333-3333-3333-333333333333>\r\nWARC-Date: 2020-01-01T00:00:00Z\r\nContent-Length: {payload_len}\r\n\r\n"
+    )
+    .unwrap();
+    archive.resize(archive.len() + payload_len, 0);
+    archive.extend_from_slice(b"\r\n\r\n");
+
+    let mut writer = fastwarc::stream_io::gzip::GzipWriter::new(Vec::new());
+    writer.write_all(&archive).unwrap();
+    let compressed = writer.into_inner().unwrap();
+    assert!(
+        compressed.len() < fastwarc_grpc::transport::MAX_MESSAGE_SIZE,
+        "test premise broken: compressed archive must fit the request limit"
+    );
+
+    let mut client = common::warc_client().await;
+    let status = client
+        .parse_archive(pb::ParseArchiveRequest {
+            config: Some(default_config()),
+            archive: compressed.into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+}
+
 /// A framing failure mid-archive returns the records parsed so far plus one
 /// non-recoverable error; partial results are kept, not discarded.
 #[tokio::test]

@@ -34,3 +34,13 @@ pub const DEFAULT_INPUT_BUFFER_SIZE: usize = 64 << 10;
 
 /// Hard limit for `input_buffer_size`: 16 MiB.
 pub const MAX_INPUT_BUFFER_SIZE: usize = crate::transport::MAX_MESSAGE_SIZE;
+
+/// Budget for the bytes collected into one unary `ParseArchive` response
+/// (payload bytes plus encoded record metadata and errors): 16 MiB.
+///
+/// The gRPC request cap only bounds the *compressed* archive; a small
+/// compressed request can decode to a far larger response. Collection stops
+/// as soon as this budget is exceeded and the RPC fails with
+/// `RESOURCE_EXHAUSTED`. Use the streaming `ParseWarc` RPC for archives
+/// whose decoded records do not fit.
+pub const MAX_UNARY_RESPONSE_SIZE: usize = crate::transport::MAX_MESSAGE_SIZE;
