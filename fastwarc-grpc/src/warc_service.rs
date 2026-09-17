@@ -13,6 +13,22 @@
 // limitations under the License.
 
 //! The `fastwarc.v1.WarcService` implementation.
+//!
+//! [`WarcParser`] implements both RPCs of the service. `ParseWarc` streams
+//! archive chunks from the client to a blocking parser task and streams parse
+//! events back; `ParseArchive` parses one complete in-message archive and
+//! returns the collected records in a single response.
+//!
+//! The streaming pipeline is split across private submodules:
+//!
+//! * `channel_reader` adapts the chunk channel fed by the client stream into
+//!   a blocking [`std::io::BufRead`] source for the parser.
+//! * `parser` runs the [FastWARC](https://docs.rs/fastwarc) iterator over
+//!   that source and turns every
+//!   record into an ordered `record_start` / `payload_chunk` / `record_end`
+//!   (or `record_error`) event sequence.
+//! * `batch` optionally packs those events into `RecordBatch` messages to
+//!   reduce per-message gRPC overhead before they reach the response stream.
 
 mod batch;
 mod channel_reader;
@@ -33,19 +49,35 @@ use crate::convert;
 use crate::defaults::{DEFAULT_INPUT_BUFFER_SIZE, MAX_HEADER_LEN, MAX_INPUT_BUFFER_SIZE, MAX_PAYLOAD_CHUNK_SIZE};
 use crate::proto::fastwarc::v1 as pb;
 
+/// Capacity of the client-chunk channel. Bounds how far the request reader
+/// can run ahead of the parser, providing backpressure to the client.
 const CHUNK_CHANNEL_BOUND: usize = 8;
+/// Capacity of the response channel. Bounds how many unsent responses the
+/// parser can produce before it blocks on the consumer.
 const RESPONSE_CHANNEL_BOUND: usize = 8;
 
+/// Sending half of the `ParseWarc` response stream, shared by the parser task
+/// and the request forwarder so either side can report a terminal `Status`.
 type ResponseSender = mpsc::Sender<Result<pb::ParseWarcResponse, Status>>;
 
+/// Where the parser task reads archive bytes from.
 enum ParserInput {
+    /// Chunks streamed by the client, delivered through a bounded channel.
     Chunks(mpsc::Receiver<Bytes>),
+    /// A file on the server, opened from the config's `archive_path`.
     LocalFile,
 }
 
 /// The `fastwarc.v1.WarcService` gRPC service.
+///
+/// Construct it with [`WarcParser::new`] (the safe default) or
+/// [`WarcParser::with_local_files`], then mount it in a tonic server through
+/// [`WarcServiceServer`](pb::warc_service_server::WarcServiceServer). See the
+/// [crate-level documentation](crate) for a complete embedding example.
 #[derive(Default)]
 pub struct WarcParser {
+    /// Whether `ParseWarc` requests may set `archive_path` to make the server
+    /// open a file from its own filesystem.
     allow_local_files: bool,
 }
 
@@ -70,6 +102,15 @@ impl WarcParser {
 impl pb::warc_service_server::WarcService for WarcParser {
     type ParseWarcStream = ReceiverStream<Result<pb::ParseWarcResponse, Status>>;
 
+    /// Handles the bidirectional streaming `ParseWarc` RPC.
+    ///
+    /// Reads and validates the leading `config` message, then wires up the
+    /// pipeline before returning: a blocking parser task consumes archive
+    /// bytes (either the client's `chunk` messages forwarded through a
+    /// bounded channel, or a local file when `archive_path` is set and
+    /// permitted) and emits parse events into the returned response stream.
+    /// Parsing proceeds concurrently with the client upload; this method
+    /// itself only performs the setup.
     async fn parse_warc(
         &self,
         request: Request<Streaming<pb::ParseWarcRequest>>,
@@ -94,6 +135,11 @@ impl pb::warc_service_server::WarcService for WarcParser {
         Ok(Response::new(ReceiverStream::new(response_rx)))
     }
 
+    /// Handles the unary `ParseArchive` RPC.
+    ///
+    /// Parses the complete in-message archive on a blocking task and returns
+    /// all records and record-level errors in one response. `archive_path` is
+    /// rejected here; server-side files are only supported by `ParseWarc`.
     async fn parse_archive(
         &self,
         request: Request<pb::ParseArchiveRequest>,
@@ -117,6 +163,10 @@ impl pb::warc_service_server::WarcService for WarcParser {
     }
 }
 
+/// Reads the mandatory leading `config` message from the request stream.
+///
+/// Returns `InvalidArgument` when the stream is empty or its first message
+/// carries anything other than a `config`.
 async fn read_config(stream: &mut Streaming<pb::ParseWarcRequest>) -> Result<pb::ParseWarcConfig, Status> {
     match stream.message().await? {
         Some(pb::ParseWarcRequest {
@@ -127,6 +177,12 @@ async fn read_config(stream: &mut Streaming<pb::ParseWarcRequest>) -> Result<pb:
     }
 }
 
+/// Runs [`run_parser`] on a blocking task and watches it for failure.
+///
+/// The parser performs blocking I/O, so it runs via
+/// [`tokio::task::spawn_blocking`]. A supervising async task awaits the join
+/// handle and converts a panic or cancellation into a terminal gRPC error on
+/// the response stream, instead of silently dropping the stream.
 fn spawn_parser(input: ParserInput, response_tx: ResponseSender, config: pb::ParseWarcConfig) {
     let error_tx = response_tx.clone();
     // Report parser task failures as terminal gRPC errors.
@@ -143,6 +199,14 @@ fn spawn_parser(input: ParserInput, response_tx: ResponseSender, config: pb::Par
     });
 }
 
+/// Forwards the client's `chunk` messages into the parser's input channel.
+///
+/// Runs until the client closes its stream (normal end of input), the parser
+/// drops its receiver (chunk send fails, e.g. after a fatal parse error), or
+/// the client violates the protocol. A duplicate `config` or a message with
+/// no `kind` set ends the stream with `InvalidArgument`; transport errors are
+/// passed through. Closing the chunk sender signals end-of-archive to the
+/// parser.
 async fn forward_chunks(
     mut stream: Streaming<pb::ParseWarcRequest>,
     chunk_tx: mpsc::Sender<Bytes>,
@@ -181,6 +245,10 @@ async fn forward_chunks(
     }
 }
 
+/// Checks a client config against the hard limits in [`crate::defaults`].
+///
+/// Rejects size limits above their caps and inverted content-length bounds
+/// with `InvalidArgument` before any parsing starts.
 fn validate_config(config: &pb::ParseWarcConfig) -> Result<(), Status> {
     validate_limit("max_header_len", config.max_header_len, MAX_HEADER_LEN)?;
     validate_limit("payload_chunk_size", config.payload_chunk_size, MAX_PAYLOAD_CHUNK_SIZE)?;
@@ -193,6 +261,8 @@ fn validate_config(config: &pb::ParseWarcConfig) -> Result<(), Status> {
     Ok(())
 }
 
+/// Rejects a config value above `max` with an `InvalidArgument` naming the
+/// offending field. Zero always passes; it selects the default downstream.
 fn validate_limit(name: &str, value: u32, max: usize) -> Result<(), Status> {
     if usize::try_from(value).unwrap_or(usize::MAX) > max {
         Err(Status::invalid_argument(format!("{name} must not exceed {max} bytes")))
@@ -201,6 +271,13 @@ fn validate_limit(name: &str, value: u32, max: usize) -> Result<(), Status> {
     }
 }
 
+/// Body of the blocking parser task behind `ParseWarc`.
+///
+/// Selects the byte source described by `input`, runs [`parse_into`] over it,
+/// and sends every event through a [`BatchEmitter`] so responses respect the
+/// config's `response_batch_size`. A failure to open a configured
+/// `archive_path` is reported as a non-recoverable `record_error` rather than
+/// a gRPC status. The final flush delivers any partially filled batch.
 fn run_parser(input: ParserInput, response_tx: &ResponseSender, config: &pb::ParseWarcConfig) {
     let mut emitter = BatchEmitter::new(response_tx, convert::response_batch_size(config));
     let mut emit = |response| emitter.emit(response);
@@ -229,6 +306,11 @@ fn run_parser(input: ParserInput, response_tx: &ResponseSender, config: &pb::Par
     emitter.flush();
 }
 
+/// Parses a complete archive and collects the results for `ParseArchive`.
+///
+/// Reuses the streaming parser and folds its event sequence back into whole
+/// [`pb::ParsedRecord`]s with assembled payloads, so both RPCs share one
+/// parsing path.
 fn collect_archive(
     reader: impl fastwarc::stream_io::traits::IntoWarcReader,
     config: &pb::ParseWarcConfig,
@@ -244,6 +326,12 @@ fn collect_archive(
     pb::ParseArchiveResponse { records, errors }
 }
 
+/// Folds one streaming event into the accumulated `ParseArchive` state.
+///
+/// `open` holds the record started by the last `record_start`: payload chunks
+/// append to it, `record_end` moves it into `records`, and `record_error`
+/// discards it and appends to `errors`. Batches are flattened recursively in
+/// order.
 fn fold_response(
     response: pb::ParseWarcResponse,
     open: &mut Option<pb::ParsedRecord>,

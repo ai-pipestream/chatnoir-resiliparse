@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Drives the [FastWARC](https://docs.rs/fastwarc) iterator and emits the
+//! `ParseWarc` event sequence.
+
 use std::cell::RefCell;
 use std::io::{self, BufRead};
 use std::rc::Rc;
@@ -25,9 +28,28 @@ use crate::convert;
 use crate::defaults::{DEFAULT_MAX_HEADER_LEN, DEFAULT_PAYLOAD_CHUNK_SIZE};
 use crate::proto::fastwarc::v1 as pb;
 
+/// Callback that receives each parse event. Returning `false` means the
+/// consumer is gone and parsing should stop.
 type EmitFn<'a> = &'a mut dyn FnMut(pb::ParseWarcResponse) -> bool;
 
 /// Parses an archive and emits one ordered response sequence per record.
+///
+/// Every record that passes the configured filters produces `record_start`,
+/// zero or more `payload_chunk` events (when payloads are included), and
+/// `record_end`, in that order. Zero-valued config sizes fall back to the
+/// defaults in [`crate::defaults`].
+///
+/// Failures map to `record_error` events rather than panics or gRPC errors:
+///
+/// * An HTTP header parse failure is emitted as a **recoverable** error in
+///   place of the record's events, and iteration continues with the next
+///   record. HTTP parsing is deferred to the iterator's filter (rather than
+///   using the iterator's own `parse_http` option) so these failures stay
+///   distinct from WARC framing failures.
+/// * A WARC framing failure (invalid header, truncated stream) is emitted as
+///   a **non-recoverable** error and ends parsing.
+///
+/// Returns early without further events once `emit` reports a gone consumer.
 pub(super) fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConfig, emit: EmitFn<'_>) {
     let chunk_size = if config.payload_chunk_size == 0 {
         DEFAULT_PAYLOAD_CHUNK_SIZE
@@ -88,6 +110,14 @@ pub(super) fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConf
     }
 }
 
+/// Emits the full event sequence for one parsed record.
+///
+/// Sends `record_start` with the record's metadata, streams the payload when
+/// the config includes it, and closes with `record_end` carrying the payload
+/// length (streamed bytes, or the declared content length when payloads are
+/// skipped). A payload read failure emits a non-recoverable `record_error`
+/// instead of `record_end`. Returns `false` when parsing should stop, either
+/// because the consumer is gone or the payload could not be read.
 fn emit_record(
     shared: &Rc<RefCell<WarcRecord>>,
     config: &pb::ParseWarcConfig,
@@ -118,6 +148,13 @@ fn emit_record(
     emit(response(pb::parse_warc_response::Kind::RecordEnd(pb::RecordEnd { payload_length })))
 }
 
+/// Streams a record's payload as `payload_chunk` events of at most
+/// `chunk_size` bytes and returns the total number of bytes streamed.
+///
+/// Chunks carry their byte offset within the payload. A record without a
+/// payload reader streams nothing and returns `0`. When the consumer is gone
+/// the failure is surfaced as [`io::ErrorKind::BrokenPipe`] so the caller
+/// stops parsing.
 fn stream_payload(record: &mut WarcRecord, chunk_size: usize, emit: EmitFn<'_>) -> io::Result<u64> {
     let Some(reader) = record.reader_mut() else {
         return Ok(0);
@@ -138,10 +175,17 @@ fn stream_payload(record: &mut WarcRecord, chunk_size: usize, emit: EmitFn<'_>) 
     }
 }
 
+/// Wraps an event kind in a `ParseWarcResponse` envelope.
 fn response(kind: pb::parse_warc_response::Kind) -> pb::ParseWarcResponse {
     pb::ParseWarcResponse { kind: Some(kind) }
 }
 
+/// Builds a `record_error` event.
+///
+/// `stream_pos` is the failed record's byte offset in the archive (zero when
+/// unknown, e.g. for a stream-level failure). Recoverable errors let the
+/// client keep consuming the stream; non-recoverable ones are the stream's
+/// final event.
 pub(super) fn record_error(stream_pos: u64, recoverable: bool, message: String) -> pb::ParseWarcResponse {
     response(pb::parse_warc_response::Kind::RecordError(pb::RecordError {
         stream_pos,
