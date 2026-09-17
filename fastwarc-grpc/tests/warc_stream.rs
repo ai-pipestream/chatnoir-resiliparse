@@ -13,8 +13,8 @@
 // limitations under the License.
 
 //! Integration tests for `WarcService.ParseWarc`: fixtures from
-//! `../tests/data` are streamed through an in-process server and compared
-//! against direct `ArchiveIterator` runs with matching options.
+//! `fastwarc-rs/tests/fixtures` are streamed through an in-process server and
+//! compared against direct `ArchiveIterator` runs with matching options.
 
 mod common;
 

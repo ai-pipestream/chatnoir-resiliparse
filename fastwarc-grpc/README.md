@@ -84,7 +84,7 @@ filesystem path. The server shuts down gracefully on SIGINT or SIGTERM.
 An example client streams a local archive and prints a per-record summary:
 
 ```sh
-cargo run -p fastwarc-grpc --example parse -- fastwarc-grpc/tests/data/warcfile.warc.gz
+cargo run -p fastwarc-grpc --example parse -- fastwarc-rs/tests/fixtures/warcfile.warc.gz
 ```
 
 A throughput benchmark following the shared profile format lives in

@@ -30,12 +30,15 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 
-/// Path to an existing repository test fixture.
+/// Path to a repository test fixture in `fastwarc-rs/tests/fixtures`.
+///
+/// The `block-sized-records.*` archives are the one exception: they ship only
+/// with the shared Python test data in the repository's `tests/data`
+/// directory.
 pub fn data_path(name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let repository_fixture = manifest_dir.join("../tests/data").join(name);
-    if repository_fixture.exists() {
-        repository_fixture
+    if name.starts_with("block-sized-records") {
+        manifest_dir.join("../tests/data").join(name)
     } else {
         manifest_dir.join("../fastwarc-rs/tests/fixtures").join(name)
     }
