@@ -84,7 +84,9 @@
 //! server reads the chunks in order.
 //! Set `archive_path` on the config to have the server open a local file instead of uploading
 //! chunks (requires a server built with `WarcParser::with_local_files`, or
-//! `FASTWARC_GRPC_ALLOW_LOCAL_FILES=1` for the bundled binary; otherwise `PermissionDenied`).
+//! `FASTWARC_GRPC_ALLOW_LOCAL_FILES=1` plus `FASTWARC_GRPC_LOCAL_FILE_ROOT=/dir` for the bundled
+//! binary; otherwise `PermissionDenied`). Requested paths are confined to the configured root
+//! directory; paths that resolve outside it are rejected with `PermissionDenied`.
 //!
 //! Each returned record has one `record_start`, zero or more `payload_chunk` messages, and one
 //! `record_end`.
@@ -206,8 +208,10 @@
 //! The service implementation is the [`warc_service::WarcParser`] struct. It can be mounted in an
 //! existing tonic server alongside other services. `WarcParser::new()` rejects `archive_path`
 //! requests with `PermissionDenied`; construct it with
-//! [`warc_service::WarcParser::with_local_files`] to let clients open files on the server
-//! (only when every client is trusted with read access to the server's files):
+//! [`warc_service::WarcParser::with_local_files`] to let clients open files on the server.
+//! Local file access is confined to the root directory passed to `with_local_files`: requested
+//! paths are canonicalized and must stay inside that directory (only use this when every client
+//! is trusted with read access to everything under the root):
 //!
 //! ```no_run
 //! use fastwarc_grpc::proto::fastwarc::v1::warc_service_server::WarcServiceServer;

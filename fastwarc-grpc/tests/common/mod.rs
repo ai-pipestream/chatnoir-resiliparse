@@ -30,15 +30,18 @@ use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 
-/// Path to an existing repository test fixture.
+/// Canonical path to an existing repository test fixture. Canonical so the
+/// path passes the server's local-file jail check, which rejects `..`
+/// components.
 pub fn data_path(name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let repository_fixture = manifest_dir.join("../tests/data").join(name);
-    if repository_fixture.exists() {
+    let fixture = if repository_fixture.exists() {
         repository_fixture
     } else {
         manifest_dir.join("../fastwarc-rs/tests/fixtures").join(name)
-    }
+    };
+    fixture.canonicalize().unwrap_or(fixture)
 }
 
 /// Iterator options matching what the service applies for a given config.
@@ -58,15 +61,23 @@ pub fn direct_options(config: &pb::ParseWarcConfig) -> ArchiveIteratorOptions {
     }
 }
 
-/// Start a `WarcService` server on an ephemeral localhost port.
+/// Start a `WarcService` server on an ephemeral localhost port. Local file
+/// access is confined to the repository root, which contains every fixture
+/// directory used by the tests.
 pub async fn start_warc_server() -> SocketAddr {
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    start_warc_server_with_root(repository_root).await
+}
+
+/// Start a `WarcService` server whose local file access is confined to
+/// `root`.
+pub async fn start_warc_server_with_root(root: impl AsRef<std::path::Path>) -> SocketAddr {
+    let parser = WarcParser::with_local_files(root).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         fastwarc_grpc::transport::configure_server(tonic::transport::Server::builder())
-            .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(
-                WarcParser::with_local_files(),
-            )))
+            .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(parser)))
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
             .unwrap();
@@ -227,6 +238,19 @@ pub fn records_only(outcomes: &[RecordOutcome]) -> Vec<(&pb::RecordMetadata, &[u
 /// Connect a `WarcServiceClient` to a fresh in-process server.
 pub async fn warc_client() -> WarcServiceClient<Channel> {
     let addr = start_warc_server().await;
+    connect_warc_client(addr).await
+}
+
+/// Connect a `WarcServiceClient` to a fresh in-process server whose local
+/// file access is confined to `root`.
+pub async fn warc_client_with_root(root: impl AsRef<std::path::Path>) -> WarcServiceClient<Channel> {
+    let addr = start_warc_server_with_root(root).await;
+    connect_warc_client(addr).await
+}
+
+/// Connect a `WarcServiceClient` to `addr` with the transport limits used by
+/// the tests.
+pub async fn connect_warc_client(addr: SocketAddr) -> WarcServiceClient<Channel> {
     WarcServiceClient::new(
         fastwarc_grpc::transport::connect(format!("http://{addr}"))
             .await

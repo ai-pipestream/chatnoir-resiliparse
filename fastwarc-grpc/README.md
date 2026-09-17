@@ -19,7 +19,9 @@ Usage documentation with worked client examples lives in the crate docs:
   `archive_path` on the config to have the server open a local file instead
   of uploading chunks (rejected with `PERMISSION_DENIED` unless the server
   was started with `FASTWARC_GRPC_ALLOW_LOCAL_FILES=1`, since it grants
-  clients read access to the server's filesystem). Receive per kept record: `record_start` (full
+  clients read access to the server's filesystem; paths are confined to the
+  directory named by `FASTWARC_GRPC_LOCAL_FILE_ROOT`, see
+  [Run](#run)). Receive per kept record: `record_start` (full
   metadata, lossless header blocks), `payload_chunk`* (offset-tagged),
   `record_end` (payload length). HTTP-header
   failures on a framed record yield a recoverable `record_error`; WARC
@@ -80,6 +82,23 @@ FASTWARC_GRPC_ADDR="[::]:50061" cargo run -p fastwarc-grpc
 
 `FASTWARC_GRPC_ADDR` also accepts `unix:///path.sock` or an absolute
 filesystem path. The server shuts down gracefully on SIGINT or SIGTERM.
+
+Local file access (`archive_path` on the request config) is disabled by
+default. To enable it, set both:
+
+```sh
+FASTWARC_GRPC_ALLOW_LOCAL_FILES=1 \
+FASTWARC_GRPC_LOCAL_FILE_ROOT=/data/warcs \
+cargo run -p fastwarc-grpc
+```
+
+`FASTWARC_GRPC_LOCAL_FILE_ROOT` is the directory that `archive_path`
+requests are confined to: requested paths are canonicalized (relative paths
+resolve against the root) and anything escaping the root — via `..`
+components or symlinks — is rejected with `PERMISSION_DENIED`. The server
+refuses to start if `FASTWARC_GRPC_ALLOW_LOCAL_FILES` is set without a
+valid root directory. Embedders get the same jail through
+`WarcParser::with_local_files(root)`.
 
 An example client streams a local archive and prints a per-record summary:
 
