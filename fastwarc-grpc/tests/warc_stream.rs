@@ -853,6 +853,60 @@ async fn omit_payload_and_headers_counts_records() {
     assert_eq!(chunks, 0);
 }
 
+/// `include_headers=false` omits the raw header blocks but still populates
+/// parsed scalar metadata: `record_id`, `record_date`, `http_content_type`,
+/// and `http_charset`.
+#[tokio::test]
+async fn omit_headers_keeps_scalar_metadata() {
+    use std::io::Write;
+
+    let http = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nbody";
+    let mut data = Vec::new();
+    write!(
+        data,
+        "WARC/1.0\r\nWARC-Type: response\r\nWARC-Record-ID: <urn:uuid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb>\r\nWARC-Date: 2020-01-02T03:04:05Z\r\nContent-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n",
+        http.len()
+    )
+    .unwrap();
+    data.extend_from_slice(http);
+    data.extend_from_slice(b"\r\n\r\n");
+
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(true),
+        include_payload: Some(false),
+        include_headers: Some(false),
+        ..Default::default()
+    };
+    let mut client = common::warc_client().await;
+    let requests = common::warc_requests(&data, 64, &config);
+    let mut stream = client
+        .parse_warc(tokio_stream::iter(requests))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut responses = Vec::new();
+    while let Some(resp) = stream.message().await.unwrap() {
+        responses.push(resp);
+    }
+    let mut starts = 0u64;
+    common::for_each_event(&responses, |resp| match resp.kind.as_ref().unwrap() {
+        pb::parse_warc_response::Kind::RecordStart(start) => {
+            let metadata = start.metadata.as_ref().unwrap();
+            assert!(metadata.warc_headers.is_none());
+            assert!(metadata.http_headers.is_none());
+            assert_eq!(metadata.record_id.as_deref(), Some("<urn:uuid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb>"));
+            let date = metadata.record_date.as_ref().unwrap();
+            assert_eq!(date.seconds, 1_577_934_245); // 2020-01-02T03:04:05Z
+            assert_eq!(metadata.http_content_type.as_deref(), Some("text/plain"));
+            assert_eq!(metadata.http_charset.as_deref(), Some("utf-8"));
+            starts += 1;
+        }
+        pb::parse_warc_response::Kind::RecordError(e) => panic!("unexpected record_error: {}", e.message),
+        _ => {}
+    });
+    assert_eq!(starts, 1);
+}
+
 /// `archive_path` parses a file on the server without uploading chunks.
 #[tokio::test]
 async fn archive_path_counts_records_without_chunks() {
