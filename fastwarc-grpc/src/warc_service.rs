@@ -149,7 +149,17 @@ async fn forward_chunks(
     response_tx: ResponseSender,
 ) {
     loop {
-        match stream.message().await {
+        // The parser may finish (and drop its chunk receiver) while the
+        // client keeps the request stream open. Without the `chunk_tx.closed()`
+        // arm this task would block on `stream.message()` forever while
+        // holding a `response_tx` clone, so the response stream would never
+        // complete. `biased` checks for the closed channel first.
+        let message = tokio::select! {
+            biased;
+            () = chunk_tx.closed() => return,
+            message = stream.message() => message,
+        };
+        match message {
             Ok(Some(pb::ParseWarcRequest {
                 kind: Some(pb::parse_warc_request::Kind::Chunk(chunk)),
             })) => {

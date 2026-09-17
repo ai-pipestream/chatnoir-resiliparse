@@ -32,3 +32,5 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 # "net" enables TcpListenerStream for the in-process integration test server.
 tokio-stream = { version = "0.1", features = ["net"] }
+# "time" enables tokio::time::timeout for hang-regression tests.
+tokio = { version = "1", features = ["time"] }
