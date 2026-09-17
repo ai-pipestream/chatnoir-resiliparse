@@ -12,21 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Blocking `Read`/`BufRead` adapter over the client's chunk channel.
+
 use std::io::{self, BufRead, Read, Seek, SeekFrom};
 
 use prost::bytes::{Buf, Bytes, BytesMut};
 use tokio::sync::mpsc;
 
+/// Bytes of magic prefix the compression detector inspects. Covers the
+/// longest magic among the supported formats (LZ4's four bytes; Gzip and Zstd
+/// use fewer).
 const MAGIC_LEN: usize = 4;
 
 /// Blocking reader over the chunks received by the streaming RPC.
+///
+/// The [FastWARC](https://docs.rs/fastwarc) parser is synchronous, so it runs
+/// on a blocking task and
+/// pulls archive bytes through this adapter, which in turn blocks on the
+/// bounded channel fed by [`forward_chunks`](super::forward_chunks). A closed
+/// channel reads as end-of-file. The reader tracks the absolute stream
+/// position to answer the parser's position queries, but the underlying
+/// stream cannot rewind, so [`Seek`] only accepts the current position.
 pub(super) struct ChannelReader {
+    /// Receiving half of the chunk channel; `None` from it means the client
+    /// stream ended.
     rx: mpsc::Receiver<Bytes>,
+    /// Unconsumed remainder of the most recently received chunk.
     current: Bytes,
+    /// Absolute position in the logical archive stream, i.e. the number of
+    /// bytes consumed so far.
     pos: u64,
 }
 
 impl ChannelReader {
+    /// A reader that yields the bytes arriving on `rx` in order.
     pub(super) fn new(rx: mpsc::Receiver<Bytes>) -> Self {
         Self {
             rx,
@@ -37,6 +56,10 @@ impl ChannelReader {
 }
 
 impl Read for ChannelReader {
+    /// Copies buffered bytes into `buf`, waiting for a chunk when necessary.
+    ///
+    /// Returns at most one buffered chunk's worth of data per call and `0`
+    /// only for an empty `buf` or at end of input.
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -50,6 +73,13 @@ impl Read for ChannelReader {
 }
 
 impl BufRead for ChannelReader {
+    /// Exposes the next unconsumed bytes, blocking on the channel when empty.
+    ///
+    /// Empty chunks are skipped, and an empty slice is returned only at end
+    /// of input. At stream position zero the buffer is guaranteed to hold at
+    /// least [`MAGIC_LEN`] bytes (unless the stream is shorter), coalescing
+    /// fragmented chunks so compression detection sees the whole magic prefix
+    /// in one window.
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
         while self.current.is_empty() {
             match self.rx.blocking_recv() {
@@ -73,6 +103,8 @@ impl BufRead for ChannelReader {
         Ok(&self.current)
     }
 
+    /// Marks up to `amt` buffered bytes as read and advances the stream
+    /// position accordingly.
     fn consume(&mut self, amt: usize) {
         let n = amt.min(self.current.len());
         self.current.advance(n);
@@ -81,6 +113,13 @@ impl BufRead for ChannelReader {
 }
 
 impl Seek for ChannelReader {
+    /// Reports the current position; actual repositioning is unsupported.
+    ///
+    /// The parser queries its position through this trait, so no-op seeks
+    /// (`SeekFrom::Current(0)` or a `SeekFrom::Start` at the current
+    /// position) succeed. Any seek that would move the stream fails with
+    /// [`io::ErrorKind::Unsupported`], since streamed chunks cannot be
+    /// replayed.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match pos {
             SeekFrom::Current(0) => Ok(self.pos),
