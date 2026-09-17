@@ -61,7 +61,19 @@ pub(super) fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConf
                 config.quirks_mode,
             )
         {
-            http_error.replace(Some((record.stream_pos(), format!("failed to parse HTTP headers: {error}"))));
+            // Payload decoder setup takes the record's reader before
+            // validating encodings, so a failure there (e.g. an unsupported
+            // Content-Encoding) leaves the record readerless and iteration
+            // cannot resume: continuing would only produce a "No reader set"
+            // framing error. Header parse failures leave the reader intact
+            // and remain recoverable.
+            let recoverable = record.reader_mut().is_some();
+            let message = if recoverable {
+                format!("failed to parse HTTP headers: {error}")
+            } else {
+                format!("failed to set up HTTP payload decoder: {error}")
+            };
+            http_error.replace(Some((record.stream_pos(), recoverable, message)));
             // Yield once so the error is emitted before iteration resumes.
             return true;
         }
@@ -76,8 +88,8 @@ pub(super) fn parse_into(reader: impl IntoWarcReader, config: &pb::ParseWarcConf
                 return;
             }
         };
-        if let Some((stream_pos, message)) = http_error.borrow_mut().take() {
-            if !emit(record_error(stream_pos, true, message)) {
+        if let Some((stream_pos, recoverable, message)) = http_error.borrow_mut().take() {
+            if !emit(record_error(stream_pos, recoverable, message)) || !recoverable {
                 return;
             }
             continue;

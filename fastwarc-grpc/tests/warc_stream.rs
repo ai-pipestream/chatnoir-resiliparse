@@ -464,6 +464,58 @@ async fn http_parse_failure_is_recoverable() {
     );
 }
 
+/// An unsupported Content-Encoding with auto-decoding enabled fails decoder
+/// setup after FastWARC has taken the record's reader, so the stream cannot
+/// continue: the service must emit one non-recoverable `record_error` and end
+/// instead of continuing into a terminal "No reader set" framing error.
+#[tokio::test]
+async fn decoder_setup_failure_is_non_recoverable() {
+    use std::io::Write;
+
+    let http = "HTTP/1.1 200 OK\r\nContent-Encoding: x-unsupported\r\nContent-Length: 4\r\n\r\nbody";
+    let mut data = Vec::new();
+    write!(
+        data,
+        "WARC/1.0\r\nWARC-Type: response\r\nWARC-Record-ID: <urn:uuid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa>\r\nWARC-Date: 2020-01-01T00:00:00Z\r\nContent-Type: application/http; msgtype=response\r\nContent-Length: {}\r\n\r\n{http}\r\n\r\n",
+        http.len()
+    )
+    .unwrap();
+    // A following record that would be reachable if the stream could continue.
+    write!(
+        data,
+        "WARC/1.0\r\nWARC-Type: resource\r\nWARC-Record-ID: <urn:uuid:bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb>\r\nWARC-Date: 2020-01-01T00:00:00Z\r\nContent-Length: 1\r\n\r\nZ\r\n\r\n"
+    )
+    .unwrap();
+
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(true),
+        decode_http_payload: pb::AutoDecode::All as i32,
+        ..Default::default()
+    };
+    let mut client = common::warc_client().await;
+    let requests = common::warc_requests(&data, 256, &config);
+    let mut stream = client
+        .parse_warc(tokio_stream::iter(requests))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut responses = Vec::new();
+    while let Some(resp) = stream.message().await.unwrap() {
+        responses.push(resp);
+        assert!(responses.len() < 20, "parser appears to be looping after a decoder setup failure");
+    }
+    let outcomes = group_responses(&responses);
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [RecordOutcome::Error(error)] if !error.recoverable
+                && error.message.contains("-Encoding: x-unsupported")
+                && !error.message.contains("No reader set")
+        ),
+        "unexpected outcomes: {outcomes:?}"
+    );
+}
+
 /// Large WARC and HTTP headers remain below the gRPC message cap when the
 /// configured parser limit permits them.
 #[tokio::test]
