@@ -23,7 +23,9 @@ Usage documentation with worked client examples lives in the crate docs:
   metadata, lossless header blocks), `payload_chunk`* (offset-tagged),
   `record_end` (payload length). HTTP-header
   failures on a framed record yield a recoverable `record_error`; WARC
-  framing failures end the stream (non-recoverable).
+  framing failures end the stream (non-recoverable). A payload read failure
+  mid-record emits a non-recoverable `record_error` plus a terminating
+  `record_end`, so every `record_start` is always matched by a `record_end`.
 - `fastwarc.v1.WarcService/ParseArchive` (unary): the whole archive in one
   request, every kept record (metadata and whole payload) in
   one response, for single records and small archives within the gRPC

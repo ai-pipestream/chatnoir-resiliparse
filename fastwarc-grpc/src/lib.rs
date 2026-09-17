@@ -197,6 +197,10 @@
 //!   reported and the stream continues.
 //! * A WARC framing failure (invalid header, truncated stream) is **non-recoverable** and ends
 //!   the response stream.
+//! * A payload read failure after `record_start` was sent is **non-recoverable**. The server
+//!   emits the `record_error` followed by a `record_end` that terminates the aborted record's
+//!   sequence (its `payload_length` counts the bytes streamed before the failure), then ends the
+//!   stream. Every `record_start` is always matched by a `record_end`.
 //!
 //! Protocol violations (missing or duplicate `config`, empty request `kind`) fail the RPC with
 //! `InvalidArgument`.

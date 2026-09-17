@@ -145,7 +145,9 @@ pub enum RecordOutcome {
         /// The closing `record_end` message.
         end: pb::RecordEnd,
     },
-    /// A `record_error` message (always outside any record sequence).
+    /// A `record_error` message. A mid-record error (payload read failure
+    /// after `record_start`) is followed by a `record_end` that terminates
+    /// the aborted record's sequence.
     Error(pb::RecordError),
 }
 
@@ -160,6 +162,9 @@ pub fn group_responses(responses: &[pb::ParseWarcResponse]) -> Vec<RecordOutcome
     let mut outcomes = Vec::new();
     // (metadata, payload bytes) of the currently open record.
     let mut open: Option<(pb::RecordMetadata, Vec<u8>)> = None;
+    // Set when a mid-record record_error aborted the open record; the
+    // terminating record_end then discards it instead of producing a Record.
+    let mut open_failed = false;
     for_each_event(responses, |resp| match resp.kind.as_ref().unwrap() {
         pb::parse_warc_response::Kind::RecordStart(start) => {
             let metadata = start.metadata.clone().unwrap();
@@ -167,6 +172,7 @@ pub fn group_responses(responses: &[pb::ParseWarcResponse]) -> Vec<RecordOutcome
             open = Some((metadata, Vec::new()));
         }
         pb::parse_warc_response::Kind::PayloadChunk(chunk) => {
+            assert!(!open_failed, "payload_chunk after a mid-record record_error");
             let (_, payload) = open.as_mut().expect("payload_chunk outside of record");
             assert_eq!(chunk.offset, u64::try_from(payload.len()).unwrap(), "non-contiguous payload chunk offset");
             payload.extend_from_slice(&chunk.data);
@@ -178,6 +184,10 @@ pub fn group_responses(responses: &[pb::ParseWarcResponse]) -> Vec<RecordOutcome
                 u64::try_from(payload.len()).unwrap(),
                 "payload_length does not match streamed bytes"
             );
+            if std::mem::take(&mut open_failed) {
+                // The aborted record was already reported as an Error outcome.
+                return;
+            }
             outcomes.push(RecordOutcome::Record {
                 metadata: Box::new(metadata),
                 payload,
@@ -185,7 +195,13 @@ pub fn group_responses(responses: &[pb::ParseWarcResponse]) -> Vec<RecordOutcome
             });
         }
         pb::parse_warc_response::Kind::RecordError(e) => {
-            assert!(open.take().is_none(), "record_error in the middle of a record: {}", e.message);
+            assert!(!open_failed, "consecutive record_error messages inside one record");
+            if open.is_some() {
+                // Mid-record payload failure: the terminating record_end must
+                // follow to close the sequence.
+                assert!(!e.recoverable, "mid-record record_error must be non-recoverable: {}", e.message);
+                open_failed = true;
+            }
             outcomes.push(RecordOutcome::Error(e.clone()));
         }
         pb::parse_warc_response::Kind::Batch(_) => {
