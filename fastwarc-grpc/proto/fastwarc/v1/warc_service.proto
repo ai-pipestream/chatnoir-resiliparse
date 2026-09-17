@@ -46,7 +46,11 @@ service WarcService {
   // chunks. When archive_path is set, the server reads that file instead.
   // Each returned record has one record_start, zero or more payload_chunk
   // messages, and one record_end. HTTP header errors are recoverable. WARC
-  // framing errors end the response stream.
+  // framing errors end the response stream. If reading a record's payload
+  // fails after record_start was sent, the server emits a non-recoverable
+  // record_error followed by a record_end that terminates that record's
+  // sequence, then ends the stream; every record_start is therefore always
+  // matched by a record_end.
   rpc ParseWarc(stream ParseWarcRequest) returns (stream ParseWarcResponse);
 
   // ParseArchive parses an archive carried in one request and returns records
@@ -149,11 +153,16 @@ message PayloadChunk {
 message RecordEnd {
   // When payload bytes are included, payload_length is the total number of
   // bytes streamed for this record. Otherwise it equals
-  // metadata.content_length, and no payload chunks are sent.
+  // metadata.content_length, and no payload chunks are sent. After a
+  // mid-record record_error, it is the number of payload bytes streamed
+  // before the failure.
   uint64 payload_length = 1;
 }
 
-// RecordError reports a record that could not be parsed.
+// RecordError reports a record that could not be parsed. When it arrives
+// between a record_start and its record_end, the failure happened while
+// streaming that record's payload and the record_end that follows terminates
+// the aborted sequence.
 message RecordError {
   // stream_pos is the byte offset in the source stream at which the failed
   // record began. Zero when the iterator does not expose a position.
