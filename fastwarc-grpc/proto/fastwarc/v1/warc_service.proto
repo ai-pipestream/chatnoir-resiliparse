@@ -103,7 +103,8 @@ message ParseWarcConfig {
   // RecordMetadata.content_length.
   optional bool include_payload = 13;
   // include_headers fills warc_headers and http_headers. Unset defaults to
-  // true. Set false to omit the header blocks.
+  // true. Set false to omit the header blocks; parsed scalar metadata
+  // (http_content_type, http_charset, record_id, record_date) stays populated.
   optional bool include_headers = 14;
   // response_batch_size packs this many protocol events into one gRPC
   // `batch` message. Zero (the default) sends one event per message.
