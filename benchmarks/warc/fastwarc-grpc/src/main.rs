@@ -204,22 +204,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  FASTWARC_GRPC_JOBS=N: N concurrent streams; reports aggregate throughput");
         return Ok(());
     }
-    let path = args[1].clone();
     let full = full_echo();
     let buf_size = buffer_size();
     let remote = server_url();
     let local = local_file();
     let jobs = jobs();
+    // Local file access is jailed to the archive's directory, so hand the
+    // server a canonical path that resolves inside that jail.
+    let path = if local {
+        std::fs::canonicalize(&args[1])?.to_string_lossy().into_owned()
+    } else {
+        args[1].clone()
+    };
 
     let sock = std::env::temp_dir().join(format!("fastwarc-grpc-bench-{}.sock", std::process::id()));
     if remote.is_none() {
+        let parser = if local {
+            let root = std::path::Path::new(&path)
+                .parent()
+                .ok_or("WARCFILE has no parent directory")?;
+            WarcParser::with_local_files(root)?
+        } else {
+            WarcParser::new()
+        };
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock)?;
         tokio::spawn(
             fastwarc_grpc::transport::configure_server(tonic::transport::Server::builder())
-                .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(
-                    WarcParser::with_local_files(),
-                )))
+                .add_service(fastwarc_grpc::transport::configure_warc_server(WarcServiceServer::new(parser)))
                 .serve_with_incoming(UnixListenerStream::new(listener)),
         );
     }

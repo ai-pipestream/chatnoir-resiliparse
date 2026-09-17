@@ -27,11 +27,18 @@ use tonic::transport::Server;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("FASTWARC_GRPC_ADDR").unwrap_or_else(|_| "[::]:50061".to_owned());
-    // Local file access is enabled only by an explicit environment setting.
+    // Local file access is enabled only by an explicit environment setting,
+    // and even then archive_path requests are confined to a root directory.
     let allow_local_files =
         matches!(std::env::var("FASTWARC_GRPC_ALLOW_LOCAL_FILES").as_deref(), Ok("1" | "true" | "TRUE"));
+    let local_file_root = std::env::var("FASTWARC_GRPC_LOCAL_FILE_ROOT").ok();
     let parser = if allow_local_files {
-        WarcParser::with_local_files()
+        let root = local_file_root.as_deref().ok_or(
+            "FASTWARC_GRPC_ALLOW_LOCAL_FILES is set but FASTWARC_GRPC_LOCAL_FILE_ROOT is not; \
+             set it to the directory that archive_path requests are confined to",
+        )?;
+        WarcParser::with_local_files(root)
+            .map_err(|error| format!("invalid FASTWARC_GRPC_LOCAL_FILE_ROOT {root}: {error}"))?
     } else {
         WarcParser::new()
     };
@@ -52,7 +59,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "fastwarc-grpc listening on {addr} (http2 stream {} MiB, connection {} MiB, local files {})",
         f64::from(fastwarc_grpc::transport::stream_window()) / 1024.0 / 1024.0,
         f64::from(fastwarc_grpc::transport::connection_window()) / 1024.0 / 1024.0,
-        if allow_local_files { "allowed" } else { "disabled" }
+        match local_file_root.as_deref().filter(|_| allow_local_files) {
+            Some(root) => format!("confined to {root}"),
+            None => "disabled".to_owned(),
+        }
     );
 
     if let Some(path) = unix_socket_path(&addr) {

@@ -19,6 +19,7 @@ mod channel_reader;
 mod parser;
 
 use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use fastwarc::stream_io::bufread::RawReaderAdapter;
 use prost::bytes::Bytes;
@@ -40,13 +41,15 @@ type ResponseSender = mpsc::Sender<Result<pb::ParseWarcResponse, Status>>;
 
 enum ParserInput {
     Chunks(mpsc::Receiver<Bytes>),
-    LocalFile,
+    LocalFile(PathBuf),
 }
 
 /// The `fastwarc.v1.WarcService` gRPC service.
 #[derive(Default)]
 pub struct WarcParser {
-    allow_local_files: bool,
+    /// Directory that `archive_path` requests are confined to. `None`
+    /// rejects every server-side path.
+    local_file_root: Option<PathBuf>,
 }
 
 impl WarcParser {
@@ -56,13 +59,59 @@ impl WarcParser {
         Self::default()
     }
 
-    /// A parser that permits server-side paths. Only use this when every
-    /// client is trusted with read access to the server's files.
-    #[must_use]
-    pub fn with_local_files() -> Self {
-        Self {
-            allow_local_files: true,
+    /// A parser that permits server-side paths confined to the `root`
+    /// directory.
+    ///
+    /// Requested paths are resolved against `root` (relative paths are
+    /// joined to it) and canonicalized; anything that escapes the root,
+    /// whether through `..` components or symlinks, is rejected with
+    /// `PermissionDenied`. Only use this when every client is trusted with
+    /// read access to everything under `root`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `root` cannot be canonicalized or is not a directory.
+    pub fn with_local_files(root: impl AsRef<Path>) -> io::Result<Self> {
+        let root = root.as_ref().canonicalize()?;
+        if !root.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("local file root {} is not a directory", root.display()),
+            ));
         }
+        Ok(Self {
+            local_file_root: Some(root),
+        })
+    }
+}
+
+/// Resolve a requested `archive_path` inside the local file root.
+///
+/// Relative paths are joined to the root. The result is canonicalized so
+/// symlinks cannot point reads outside the root; `..` components are
+/// rejected outright so paths that do not exist cannot escape either.
+fn resolve_jailed_path(root: &Path, requested: &str) -> Result<PathBuf, Status> {
+    let denied = || {
+        Status::permission_denied(format!(
+            "archive_path {requested} is outside the local file root configured on this server"
+        ))
+    };
+    let requested_path = Path::new(requested);
+    if requested_path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(denied());
+    }
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    // A missing file cannot be canonicalized; keep the lexical path (already
+    // free of `..`) so opening it later reports the usual record error.
+    let resolved = candidate.canonicalize().unwrap_or(candidate);
+    if resolved.starts_with(root) {
+        Ok(resolved)
+    } else {
+        Err(denied())
     }
 }
 
@@ -77,19 +126,23 @@ impl pb::warc_service_server::WarcService for WarcParser {
         let mut stream = request.into_inner();
         let config = read_config(&mut stream).await?;
         validate_config(&config)?;
-        if !config.archive_path.is_empty() && !self.allow_local_files {
+        let local_path = if config.archive_path.is_empty() {
+            None
+        } else if let Some(root) = &self.local_file_root {
+            Some(resolve_jailed_path(root, &config.archive_path)?)
+        } else {
             return Err(Status::permission_denied(
                 "archive_path is disabled on this server; stream the archive as chunks instead",
             ));
-        }
+        };
 
         let (response_tx, response_rx) = mpsc::channel(RESPONSE_CHANNEL_BOUND);
-        if config.archive_path.is_empty() {
+        if let Some(path) = local_path {
+            spawn_parser(ParserInput::LocalFile(path), response_tx, config);
+        } else {
             let (chunk_tx, chunk_rx) = mpsc::channel::<Bytes>(CHUNK_CHANNEL_BOUND);
             spawn_parser(ParserInput::Chunks(chunk_rx), response_tx.clone(), config);
             tokio::spawn(forward_chunks(stream, chunk_tx, response_tx));
-        } else {
-            spawn_parser(ParserInput::LocalFile, response_tx, config);
         }
         Ok(Response::new(ReceiverStream::new(response_rx)))
     }
@@ -208,13 +261,14 @@ fn run_parser(input: ParserInput, response_tx: &ResponseSender, config: &pb::Par
         ParserInput::Chunks(chunk_rx) => {
             parse_into(RawReaderAdapter::new(ChannelReader::new(chunk_rx)), config, &mut emit);
         }
-        ParserInput::LocalFile => {
+        ParserInput::LocalFile(path) => {
             let input_buffer_size = if config.input_buffer_size == 0 {
                 DEFAULT_INPUT_BUFFER_SIZE
             } else {
                 config.input_buffer_size as usize
             };
-            match std::fs::File::open(&config.archive_path) {
+            // Error messages echo the requested path, not the resolved one.
+            match std::fs::File::open(&path) {
                 Ok(file) => parse_into(io::BufReader::with_capacity(input_buffer_size, file), config, &mut emit),
                 Err(error) => {
                     emit(record_error(

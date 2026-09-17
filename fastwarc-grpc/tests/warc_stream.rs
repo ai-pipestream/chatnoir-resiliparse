@@ -905,12 +905,17 @@ async fn batched_stream_matches_unbatched() {
     assert_eq!(unbatched.len(), 50);
 }
 
-/// A missing `archive_path` file yields one non-recoverable `record_error`
-/// naming the path, then a clean stream end.
+/// A missing `archive_path` file inside the local file root yields one
+/// non-recoverable `record_error` naming the path, then a clean stream end.
 #[tokio::test]
 async fn archive_path_missing_file_reports_error() {
+    // A canonical directory inside the jail, but the file does not exist.
+    let missing = data_path("warcfile.warc")
+        .parent()
+        .unwrap()
+        .join("definitely-not-here.warc");
     let config = pb::ParseWarcConfig {
-        archive_path: "/nonexistent/definitely-not-here.warc".to_owned(),
+        archive_path: missing.to_string_lossy().into_owned(),
         ..Default::default()
     };
     let mut client = common::warc_client().await;
