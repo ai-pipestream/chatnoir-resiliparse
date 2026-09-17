@@ -12,8 +12,14 @@ use tonic::transport::{Channel, Uri};
 use tower::service_fn;
 
 const DEFAULT_BUFFER_SIZE: usize = 64 << 10;
-const DEFAULT_PAYLOAD_CHUNK_SIZE: usize = 1024 << 10;
 const REQUEST_CHANNEL_BYTES: usize = 32 * 1024 * 1024;
+
+/// Payload bytes per `payload_chunk` response message: 1 MiB, clamped to the
+/// server's hard limit (`MAX_PAYLOAD_CHUNK_SIZE`, 8 MiB) so the config can
+/// never be rejected with InvalidArgument before the run measures anything.
+fn payload_chunk_size() -> usize {
+    (1 << 20).min(fastwarc_grpc::defaults::MAX_PAYLOAD_CHUNK_SIZE)
+}
 
 fn buffer_size() -> usize {
     std::env::var("BUFFER_SIZE")
@@ -70,7 +76,7 @@ fn spawn_feeder(
             parse_http: Some(false),
             verify_digests: false,
             input_buffer_size: buf_size as u32,
-            payload_chunk_size: DEFAULT_PAYLOAD_CHUNK_SIZE as u32,
+            payload_chunk_size: payload_chunk_size() as u32,
             include_payload: Some(full),
             include_headers: Some(full),
             response_batch_size: 64,
