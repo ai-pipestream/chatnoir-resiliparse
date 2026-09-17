@@ -408,6 +408,47 @@ async fn corrupt_midstream_ends_without_hang() {
     ));
 }
 
+/// Regression test for a server hang: if the parser finishes early (here via
+/// a non-recoverable framing error) while the client keeps the request stream
+/// open without sending further chunks, the server must still complete the
+/// response stream instead of blocking forever on the next request message.
+#[tokio::test]
+async fn parser_finish_with_open_request_stream_completes() {
+    let data = common::corrupt_archive();
+    let mut client = common::warc_client().await;
+
+    // Queue the config and all chunks up front, but keep `req_tx` alive so
+    // the request stream stays open after the parser has given up.
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<pb::ParseWarcRequest>(16);
+    for request in common::warc_requests(&data, 64, &default_config()) {
+        req_tx.send(request).await.unwrap();
+    }
+
+    let mut stream = client
+        .parse_warc(tokio_stream::wrappers::ReceiverStream::new(req_rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let collect = async {
+        let mut responses = Vec::new();
+        while let Some(resp) = stream.message().await.unwrap() {
+            responses.push(resp);
+        }
+        responses
+    };
+    let responses = tokio::time::timeout(std::time::Duration::from_secs(10), collect)
+        .await
+        .expect("response stream did not complete while the request stream stayed open");
+
+    let outcomes = group_responses(&responses);
+    assert!(matches!(
+        outcomes.as_slice(),
+        [RecordOutcome::Record { .. }, RecordOutcome::Error(error)] if !error.recoverable
+    ));
+    drop(req_tx);
+}
+
 /// Oversized HTTP headers fail recoverably; the following record still parses.
 ///
 /// `max_header_len` applies to both WARC and HTTP headers, so the fixture keeps
