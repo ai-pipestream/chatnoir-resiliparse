@@ -17,100 +17,175 @@
 //! Tools for iterating DOM (sub) trees.
 
 use crate::parse::html::dom::node::{ElementNode, Node, NodeRef};
-use crate::parse::html::dom::traits::{NodeInterface, NodeInterfaceBaseImpl};
+use crate::parse::html::dom::traits::NodeInterface;
 use crate::parse::html::dom::wrap_any_raw_node;
 use crate::third_party::lexbor::*;
-use parking_lot::ReentrantMutex;
+use std::error::Error;
+use std::fmt::{Display, Formatter};
+use std::iter::FusedIterator;
 use std::ptr;
+use std::sync::Arc;
 
-pub(crate) struct NodeIteratorRaw {
-    root: ReentrantMutex<*mut lxb_dom_node_t>,
-    next_node: ReentrantMutex<*mut lxb_dom_node_t>,
+use crate::parse::html::tree::HTMLDocument;
+
+// Only the owning TraversalState is Send; an unowned raw cursor is not.
+struct NodeIteratorRaw {
+    root: *mut lxb_dom_node_t,
+    next_node: *mut lxb_dom_node_t,
 }
-
-unsafe impl Send for NodeIteratorRaw {}
-unsafe impl Sync for NodeIteratorRaw {}
 
 impl NodeIteratorRaw {
-    pub(crate) unsafe fn new(root: *mut lxb_dom_node_t) -> Self {
-        Self {
-            root: ReentrantMutex::new(root),
-            next_node: ReentrantMutex::new(root),
-        }
+    fn is_exhausted(&self) -> bool {
+        self.next_node.is_null()
     }
-}
 
-impl Iterator for NodeIteratorRaw {
-    type Item = *mut lxb_dom_node_t;
+    fn new(root: *mut lxb_dom_node_t) -> Self {
+        Self { root, next_node: root }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.next_node.get_mut();
-        let root = self.root.get_mut();
-        if next.is_null() || root.is_null() {
+    // The caller must hold the document lock and verify that its epoch has not
+    // changed since construction. A raw cursor cannot enforce either condition.
+    unsafe fn next_unchecked(&mut self) -> Option<*mut lxb_dom_node_t> {
+        if self.next_node.is_null() || self.root.is_null() {
             return None;
         }
-
-        let return_node = next.clone();
+        let result = self.next_node;
         unsafe {
-            if !(*(*next)).first_child.is_null() {
-                *next = (*(*next)).first_child;
+            if !(*self.next_node).first_child.is_null() {
+                self.next_node = (*self.next_node).first_child;
             } else {
-                while next != root && (*(*next)).next.is_null() {
-                    *next = (*(*next)).parent;
+                while self.next_node != self.root && (*self.next_node).next.is_null() {
+                    self.next_node = (*self.next_node).parent;
                 }
-                if next == root {
-                    *next = ptr::null_mut();
-                    return Some(return_node);
-                }
-                *next = (*(*next)).next;
+                self.next_node = if self.next_node == self.root {
+                    ptr::null_mut()
+                } else {
+                    (*self.next_node).next
+                };
             }
         }
-        Some(return_node)
+        Some(result)
     }
 }
 
 // -------------------------------------- Generic Iterators ----------------------------------------
 
+/// A lazy traversal was invalidated by mutation of its document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraversalError {
+    TreeModified,
+}
+
+impl Display for TraversalError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TreeModified => f.write_str("DOM document modified during traversal"),
+        }
+    }
+}
+
+impl Error for TraversalError {}
+
+struct TraversalState {
+    document: Arc<HTMLDocument>,
+    expected_epoch: u64,
+    cursor: NodeIteratorRaw,
+    finished: bool,
+}
+
+// SAFETY: the cursor's document is retained, and all cursor dereferences occur
+// in next() under the document lock after checking the mutation epoch. Moving
+// the cursor does not itself access native memory.
+unsafe impl Send for TraversalState {}
+
+impl TraversalState {
+    fn new(root: NodeRef<'_>) -> Self {
+        let document = root.tree_();
+        let (expected_epoch, cursor) = {
+            let _guard = document.doc_ptr();
+            (document.mutation_epoch(), NodeIteratorRaw::new(root.node_ptr_()))
+        };
+        Self {
+            document,
+            expected_epoch,
+            cursor,
+            finished: false,
+        }
+    }
+
+    fn next(&mut self) -> Option<Result<Node, TraversalError>> {
+        if self.finished {
+            return None;
+        }
+        let _guard = self.document.doc_ptr();
+        // Testing a saved pointer for null does not dereference native memory.
+        // Already exhausted iterators remain exhausted even after mutation.
+        if self.cursor.is_exhausted() {
+            self.finished = true;
+            return None;
+        }
+        if self.document.mutation_epoch() != self.expected_epoch {
+            self.finished = true;
+            return Some(Err(TraversalError::TreeModified));
+        }
+        // Keep the document locked through cursor advancement and ref-counting
+        // the result, so a writer cannot free either pointer between these steps.
+        let result = unsafe { self.cursor.next_unchecked() }.and_then(|node| wrap_any_raw_node(&self.document, node));
+        if result.is_none() || self.cursor.is_exhausted() {
+            self.finished = true;
+        }
+        result.map(Ok)
+    }
+}
+
 macro_rules! impl_iterator_for {
     ($Self: ty) => {
         impl Iterator for $Self {
-            type Item = Node;
+            type Item = Result<Node, TraversalError>;
 
             fn next(&mut self) -> Option<Self::Item> {
-                wrap_any_raw_node(&self.root.tree_(), self.iterator_raw.next()?)
+                self.state.next()
             }
         }
+
+        impl FusedIterator for $Self {}
     };
 }
 
+/// Lazy pre-order traversal of a subtree, including its root.
+///
+/// Construction and iterator storage are O(1). Mutations anywhere in the owning
+/// document invalidate traversal: the next step yields [TraversalError::TreeModified]
+/// once, then the iterator is exhausted. Already exhausted iterators stay exhausted.
+/// Native reference-count changes alone do not invalidate traversal, but node
+/// destruction and value/attribute setters conservatively do.
 pub struct NodeIterator<'a> {
-    root: NodeRef<'a>,
-    iterator_raw: NodeIteratorRaw,
+    state: TraversalState,
+    _root: NodeRef<'a>,
 }
 
 impl<'a> NodeIterator<'a> {
     pub(crate) fn new(root: NodeRef<'a>) -> Self {
-        let ptr = *root.node_ptr_();
         Self {
-            root,
-            iterator_raw: unsafe { NodeIteratorRaw::new(ptr) },
+            state: TraversalState::new(root.clone()),
+            _root: root,
         }
     }
 }
 
 impl_iterator_for!(NodeIterator<'_>);
 
+/// Owned lazy traversal with the same invalidation semantics as [NodeIterator].
 pub struct NodeIteratorOwned {
-    root: Node,
-    iterator_raw: NodeIteratorRaw,
+    state: TraversalState,
+    _root: Node,
 }
 
 impl NodeIteratorOwned {
     pub(crate) fn new(root: Node) -> Self {
-        let ptr = root.node_ptr_().clone();
         Self {
-            root,
-            iterator_raw: unsafe { NodeIteratorRaw::new(ptr) },
+            state: TraversalState::new(root.as_noderef()),
+            _root: root,
         }
     }
 }
@@ -119,31 +194,31 @@ impl_iterator_for!(NodeIteratorOwned);
 
 // --------------------------------------- ElementIterator -----------------------------------------
 
+/// Lazy element-only pre-order traversal, including an element root.
+///
+/// Invalidation errors are forwarded once, as described by [NodeIterator].
 pub struct ElementIterator<'a> {
-    root: &'a dyn NodeInterface,
-    iterator_raw: NodeIteratorRaw,
+    nodes: NodeIterator<'a>,
 }
 
 impl<'a> ElementIterator<'a> {
     pub(crate) fn new(root: &'a dyn NodeInterface) -> Self {
         Self {
-            root,
-            iterator_raw: unsafe { NodeIteratorRaw::new(*root.node_ptr_()) },
+            nodes: NodeIterator::new(root.as_noderef()),
         }
     }
 }
 
 impl Iterator for ElementIterator<'_> {
-    type Item = ElementNode;
+    type Item = Result<ElementNode, TraversalError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let tree = &self.root.tree_();
-        while let Some(next) = unsafe { self.iterator_raw.next()?.as_ref() } {
-            if next.type_ != lxb_dom_node_type_t::LXB_DOM_NODE_TYPE_ELEMENT {
-                continue;
-            }
-            return Some(ElementNode::new(&tree, self.iterator_raw.next()?));
-        }
-        None
+        self.nodes.find_map(|node| match node {
+            Ok(Node::Element(element)) => Some(Ok(element)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
     }
 }
+
+impl FusedIterator for ElementIterator<'_> {}

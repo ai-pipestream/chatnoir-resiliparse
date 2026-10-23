@@ -23,7 +23,7 @@ use crate::parse::html::dom::traits::*;
 use crate::parse::html::dom::*;
 use crate::parse::html::lexbor::{str_from_lxb_char_t, str_from_lxb_str_cb, str_from_lxb_str_t};
 use crate::parse::html::serialize::{node_format_visible_text, node_serialize_html};
-use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
+use std::cell::Cell;
 use std::fmt::{Debug, Display, Formatter};
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -35,8 +35,78 @@ pub use crate::parse::html::dom::traits::NodeType;
 
 // ----------------------------------------- Node Base Enum ----------------------------------------
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum Node {
+// Keep the owned and borrowed node variants and their common dispatch together.
+macro_rules! define_node_enums {
+    ($($Variant:ident($Type:ty)),+ $(,)?) => {
+        /// An owned DOM node. Use concrete types' `TryFrom<Node>` implementations
+        /// for checked downcasts; a mismatch returns `Err(original_node)`.
+        /// Borrowed access is available through the `as_*` capability views.
+        /// Common operations and traversal use the shared [`NodeInterface`] trait.
+        #[derive(Clone, PartialEq, Debug)]
+        pub enum Node { $($Variant($Type)),+ }
+
+        #[derive(Clone, PartialEq, Debug)]
+        pub enum NodeRef<'a> { $($Variant(&'a $Type)),+ }
+
+        #[derive(PartialEq, Debug)]
+        pub enum NodeRefMut<'a> { $($Variant(&'a mut $Type)),+ }
+
+        impl NodeInterfaceBaseImpl for Node {
+            fn tree_(&self) -> Arc<HTMLDocument> {
+                match self { $(Self::$Variant(node) => node.tree_()),+ }
+            }
+
+            fn node_ptr_(&self) -> *mut lxb_dom_node_t {
+                match self { $(Self::$Variant(node) => node.node_ptr_()),+ }
+            }
+
+            fn reset_node_ptr_(&self) {
+                match self { $(Self::$Variant(node) => node.reset_node_ptr_()),+ }
+            }
+        }
+
+        impl NodeInterface for Node {
+            fn as_noderef(&self) -> NodeRef<'_> {
+                match self { $(Self::$Variant(node) => NodeRef::$Variant(node)),+ }
+            }
+
+            fn as_noderef_mut(&mut self) -> NodeRefMut<'_> {
+                match self { $(Self::$Variant(node) => NodeRefMut::$Variant(node)),+ }
+            }
+
+            fn as_node(&self) -> Node { self.clone() }
+            fn into_node(self) -> Node { self }
+        }
+
+        impl Display for Node {
+            fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                match self { $(Self::$Variant(node) => Display::fmt(node, f)),+ }
+            }
+        }
+
+        impl Deref for NodeRef<'_> {
+            type Target = dyn NodeInterface;
+            fn deref(&self) -> &Self::Target {
+                match self { $(Self::$Variant(node) => *node),+ }
+            }
+        }
+
+        impl Deref for NodeRefMut<'_> {
+            type Target = dyn NodeInterface;
+            fn deref(&self) -> &Self::Target {
+                match self { $(Self::$Variant(node) => *node),+ }
+            }
+        }
+
+        impl DerefMut for NodeRefMut<'_> {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                match self { $(Self::$Variant(node) => *node),+ }
+            }
+        }
+    };
+}
+
+define_node_enums! {
     Element(ElementNode),
     Attribute(AttrNode),
     Text(TextNode),
@@ -49,109 +119,98 @@ pub enum Node {
     Notation(NotationNode), // legacy
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub enum NodeRef<'a> {
+/// Borrowed parent capability. Constructing or copying this view does not clone
+/// a native handle. Operations use `ParentNode` and the shared document lock.
+///
+/// ```
+/// use resiliparse::parse::html::{dom::traits::NodeInterface, tree::HTMLTree};
+///
+/// let tree = HTMLTree::parse("<a href='/page'>link</a>").unwrap();
+/// let node = tree.body().unwrap().into_node();
+/// if let Some(parent) = node.as_parent() {
+///     assert_eq!(parent.query_selector_all("a[href]").unwrap().len(), 1);
+/// }
+/// ```
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ParentNodeRef<'a> {
     Element(&'a ElementNode),
-    Attribute(&'a AttrNode),
+    Document(&'a DocumentNode),
+    DocumentFragment(&'a DocumentFragmentNode),
+}
+
+impl<'a> Deref for ParentNodeRef<'a> {
+    type Target = dyn ParentNode + 'a;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Element(node) => *node,
+            Self::Document(node) => *node,
+            Self::DocumentFragment(node) => *node,
+        }
+    }
+}
+
+/// Borrowed character-data capability. Constructing or copying this view does
+/// not clone a native handle. Operations use `CharacterData`'s scalar indices and the shared document lock.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CharacterDataRef<'a> {
     Text(&'a TextNode),
     CdataSection(&'a CdataSectionNode),
-    ProcessingInstruction(&'a ProcessingInstructionNode),
     Comment(&'a CommentNode),
-    Document(&'a DocumentNode),
-    DocumentType(&'a DocumentTypeNode),
-    DocumentFragment(&'a DocumentFragmentNode),
-    Notation(&'a NotationNode), // legacy
+    ProcessingInstruction(&'a ProcessingInstructionNode),
 }
 
-#[derive(PartialEq, Debug)]
-pub enum NodeRefMut<'a> {
-    Element(&'a mut ElementNode),
-    Attribute(&'a mut AttrNode),
-    Text(&'a mut TextNode),
-    CdataSection(&'a mut CdataSectionNode),
-    ProcessingInstruction(&'a mut ProcessingInstructionNode),
-    Comment(&'a mut CommentNode),
-    Document(&'a mut DocumentNode),
-    DocumentType(&'a mut DocumentTypeNode),
-    DocumentFragment(&'a mut DocumentFragmentNode),
-    Notation(&'a mut NotationNode), // legacy
-}
+impl<'a> Deref for CharacterDataRef<'a> {
+    type Target = dyn CharacterData + 'a;
 
-macro_rules! unwrap_node {
-    ($node: ident) => {
-        match $node {
-            Node::Element(n) => n,
-            Node::Attribute(n) => n,
-            Node::Text(n) => n,
-            Node::CdataSection(n) => n,
-            Node::ProcessingInstruction(n) => n,
-            Node::Comment(n) => n,
-            Node::Document(n) => n,
-            Node::DocumentType(n) => n,
-            Node::DocumentFragment(n) => n,
-            Node::Notation(n) => n, // legacy
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Text(node) => *node,
+            Self::CdataSection(node) => *node,
+            Self::Comment(node) => *node,
+            Self::ProcessingInstruction(node) => *node,
         }
-    };
+    }
 }
 
-macro_rules! unwrap_noderef {
-    ($Enum: ident, $node: ident) => {
-        match $node {
-            $Enum::Element(n) => *n,
-            $Enum::Attribute(n) => *n,
-            $Enum::Text(n) => *n,
-            $Enum::CdataSection(n) => *n,
-            $Enum::ProcessingInstruction(n) => *n,
-            $Enum::Comment(n) => *n,
-            $Enum::Document(n) => *n,
-            $Enum::DocumentType(n) => *n,
-            $Enum::DocumentFragment(n) => *n,
-            $Enum::Notation(n) => *n, // legacy
+macro_rules! impl_node_views {
+    ($($Node:ty),+ $(,)?) => {$(
+        impl $Node {
+            /// Borrow this node as an element, if it is one.
+            pub fn as_element(&self) -> Option<&ElementNode> {
+                match self { Self::Element(node) => Some(node), _ => None }
+            }
+
+            /// Borrow this node as text. CDATA has its own concrete node type.
+            pub fn as_text(&self) -> Option<&TextNode> {
+                match self { Self::Text(node) => Some(node), _ => None }
+            }
+
+            /// Borrow the parent capability without cloning a node handle.
+            pub fn as_parent(&self) -> Option<ParentNodeRef<'_>> {
+                match self {
+                    Self::Element(node) => Some(ParentNodeRef::Element(node)),
+                    Self::Document(node) => Some(ParentNodeRef::Document(node)),
+                    Self::DocumentFragment(node) => Some(ParentNodeRef::DocumentFragment(node)),
+                    _ => None,
+                }
+            }
+
+            /// Borrow the character-data capability without cloning a node handle.
+            pub fn as_character_data(&self) -> Option<CharacterDataRef<'_>> {
+                match self {
+                    Self::Text(node) => Some(CharacterDataRef::Text(node)),
+                    Self::CdataSection(node) => Some(CharacterDataRef::CdataSection(node)),
+                    Self::Comment(node) => Some(CharacterDataRef::Comment(node)),
+                    Self::ProcessingInstruction(node) => Some(CharacterDataRef::ProcessingInstruction(node)),
+                    _ => None,
+                }
+            }
         }
-    };
+    )+};
 }
 
-impl Deref for Node {
-    type Target = dyn NodeInterface;
-
-    fn deref(&self) -> &Self::Target {
-        unwrap_node!(self)
-    }
-}
-
-impl DerefMut for Node {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unwrap_node!(self)
-    }
-}
-
-impl<'a> Deref for NodeRef<'a> {
-    type Target = dyn NodeInterface;
-
-    fn deref(&self) -> &Self::Target {
-        unwrap_noderef!(NodeRef, self)
-    }
-}
-
-impl<'a> Deref for NodeRefMut<'a> {
-    type Target = dyn NodeInterface;
-
-    fn deref(&self) -> &Self::Target {
-        unwrap_noderef!(NodeRefMut, self)
-    }
-}
-
-impl<'a> DerefMut for NodeRefMut<'a> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unwrap_noderef!(NodeRefMut, self)
-    }
-}
-
-impl Display for Node {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(self.deref(), f)
-    }
-}
+impl_node_views!(Node, NodeRef<'_>, NodeRefMut<'_>);
 
 impl Display for NodeRef<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -166,7 +225,7 @@ impl Display for NodeRefMut<'_> {
 }
 
 impl IntoIterator for Node {
-    type Item = Node;
+    type Item = Result<Node, TraversalError>;
     type IntoIter = NodeIteratorOwned;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -178,6 +237,10 @@ impl IntoIterator for Node {
 
 macro_rules! check_node {
     ($node: expr) => {
+        // Hold the document lock for the caller's entire operation, before
+        // accessing native memory or changing a handle's validity.
+        let document = $node.tree_();
+        let _document_guard = document.doc_ptr();
         if $node.node_ptr_().is_null() {
             return Default::default();
         }
@@ -186,52 +249,125 @@ macro_rules! check_node {
 pub(crate) use check_node;
 
 macro_rules! check_nodes {
-    ($node1: expr, $node2: expr) => {{
-        if !Arc::ptr_eq(&$node1.tree_(), &$node2.tree_())
-            || (*$node1.node_ptr_()).is_null()
-            || (*$node2.node_ptr_()).is_null()
-            || *$node1.node_ptr_() == *$node2.node_ptr_()
-        {
+    ($node1: expr, $node2: expr) => {
+        // Identity is valid for some operations (e.g. contains and replacement).
+        // Only validate handles and document ownership here.
+        if !Arc::ptr_eq(&$node1.tree_(), &$node2.tree_()) {
             return Default::default();
         }
-    }};
+        let document = $node1.tree_();
+        let _document_guard = document.doc_ptr();
+        if ($node1.node_ptr_()).is_null() || ($node2.node_ptr_()).is_null() {
+            return Default::default();
+        }
+    };
 }
 pub(crate) use check_nodes;
 
+/// A shared native-node handle. The document owns native storage; handles keep
+/// that owner alive and retain native references. Identity is the document and
+/// native node pointer, independent of Rust wrapper addresses or tree position.
+/// Decomposition invalidates this handle; clones remain separately retained.
+/// Only live handles have a comparable native identity.
+struct NodeHandle {
+    document: Arc<HTMLDocument>,
+    node: Cell<*mut lxb_dom_node_t>,
+}
+
+// SAFETY: all native access, including reference counts and destruction, uses
+// the document lock. Cell keeps individual handles !Sync; clones can be sent.
+unsafe impl Send for NodeHandle {}
+
+impl NodeHandle {
+    fn new(document: &Arc<HTMLDocument>, node: *mut lxb_dom_node_t, kind: NodeType) -> Self {
+        let _guard = document.doc_ptr();
+        if !node.is_null() {
+            unsafe {
+                assert_eq!((*node).type_, kind as u32, "Incorrect concrete DOM node kind");
+                (*node).ref_count += 1;
+            }
+        }
+        Self {
+            document: document.clone(),
+            node: Cell::new(node),
+        }
+    }
+}
+
+impl Clone for NodeHandle {
+    fn clone(&self) -> Self {
+        let _guard = self.document.doc_ptr();
+        let node = self.node.get();
+        if !node.is_null() {
+            unsafe {
+                (*node).ref_count += 1;
+            }
+        }
+        Self {
+            document: self.document.clone(),
+            node: Cell::new(node),
+        }
+    }
+}
+
+impl Drop for NodeHandle {
+    fn drop(&mut self) {
+        let _guard = self.document.doc_ptr();
+        let node = self.node.get();
+        if node.is_null() {
+            return;
+        }
+        unsafe {
+            if (*node).parent.is_null() && (*node).ref_count < 2 {
+                self.document.mark_mutated();
+                lxb_dom_node_destroy_deep(node);
+            } else {
+                (*node).ref_count -= 1;
+            }
+        }
+    }
+}
+
+impl PartialEq for NodeHandle {
+    fn eq(&self, other: &Self) -> bool {
+        if !Arc::ptr_eq(&self.document, &other.document) {
+            return false;
+        }
+        let _guard = self.document.doc_ptr();
+        let node = self.node.get();
+        !node.is_null() && node == other.node.get()
+    }
+}
+
 macro_rules! define_node_type {
     ($Self: ident, $EnumType: ident) => {
+        #[derive(Clone, PartialEq)]
         pub struct $Self {
-            pub(crate) tree: Arc<HTMLDocument>,
-            pub(crate) node: ReentrantMutex<*mut lxb_dom_node_t>,
+            handle: NodeHandle,
         }
 
-        unsafe impl Send for $Self {}
-        unsafe impl Sync for $Self {}
+        impl $Self {
+            pub(crate) fn new(tree: &Arc<HTMLDocument>, node: *mut lxb_dom_node_t) -> Self {
+                Self {
+                    handle: NodeHandle::new(tree, node, NodeType::$EnumType),
+                }
+            }
+        }
 
         impl NodeInterfaceBaseImpl for $Self {
-            fn new(tree: &Arc<HTMLDocument>, node: *mut lxb_dom_node_t) -> Self {
-                if !node.is_null() {
-                    unsafe { (*node).ref_count += 1 };
-                }
-                Self {
-                    tree: tree.clone(),
-                    node: ReentrantMutex::new(node),
-                }
-            }
-
             #[inline(always)]
             fn tree_(&self) -> Arc<HTMLDocument> {
-                self.tree.clone()
+                self.handle.document.clone()
             }
 
             #[inline(always)]
-            fn node_ptr_(&self) -> ReentrantMutexGuard<'_, *mut lxb_dom_node_t> {
-                self.node.lock()
+            fn node_ptr_(&self) -> *mut lxb_dom_node_t {
+                self.handle.node.get()
             }
 
             #[inline(always)]
-            fn reset_node_ptr_(&mut self) {
-                *self.node.get_mut() = ptr::null_mut();
+            fn reset_node_ptr_(&self) {
+                self.handle.node.set(ptr::null_mut());
             }
         }
 
@@ -254,36 +390,6 @@ macro_rules! define_node_type {
             #[inline(always)]
             fn into_node(self) -> Node {
                 Node::$EnumType(self)
-            }
-        }
-
-        impl Drop for $Self {
-            fn drop(&mut self) {
-                if self.node_ptr_().is_null() {
-                    return;
-                }
-
-                unsafe {
-                    if (*(*self.node_ptr_())).parent.is_null() && (*(*self.node_ptr_())).ref_count < 2 {
-                        // Destroy orphaned nodes if we're the only ones still holding a reference
-                        lxb_dom_node_destroy_deep(*self.node_ptr_());
-                    } else {
-                        (*(*self.node_ptr_())).ref_count -= 1;
-                    }
-                }
-                self.reset_node_ptr_();
-            }
-        }
-
-        impl Clone for $Self {
-            fn clone(&self) -> Self {
-                $Self::new(&self.tree_(), *self.node_ptr_())
-            }
-        }
-
-        impl PartialEq<$Self> for $Self {
-            fn eq(&self, other: &Self) -> bool {
-                *self.node_ptr_() == *other.node_ptr_() && !(*self.node_ptr_()).is_null()
             }
         }
 
@@ -323,11 +429,13 @@ macro_rules! define_node_type {
             }
         }
 
-        impl From<Node> for $Self {
-            fn from(value: Node) -> $Self {
+        impl TryFrom<Node> for $Self {
+            type Error = Node;
+
+            fn try_from(value: Node) -> Result<Self, Self::Error> {
                 match value {
-                    Node::$EnumType(d) => d,
-                    _ => panic!("Illegal DOM Node type coercion."),
+                    Node::$EnumType(node) => Ok(node),
+                    node => Err(node),
                 }
             }
         }
@@ -339,7 +447,7 @@ macro_rules! define_node_type {
         }
 
         impl IntoIterator for $Self {
-            type Item = Node;
+            type Item = Result<Node, TraversalError>;
             type IntoIter = NodeIteratorOwned;
 
             fn into_iter(self) -> Self::IntoIter {
@@ -349,6 +457,7 @@ macro_rules! define_node_type {
 
         impl Debug for $Self {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                let _guard = self.handle.document.doc_ptr();
                 if self.node_ptr_().is_null() {
                     return f.write_str("<#undef>");
                 }
@@ -378,7 +487,8 @@ macro_rules! define_node_type {
 
         impl Display for $Self {
             fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&node_serialize_html(*self.node_ptr_()))
+                let _guard = self.handle.document.doc_ptr();
+                f.write_str(&node_serialize_html(self.node_ptr_()))
             }
         }
     };
@@ -389,19 +499,22 @@ macro_rules! define_node_type {
 define_node_type!(DocumentTypeNode, DocumentType);
 
 //noinspection DuplicatedCode
-impl DocumentType for DocumentTypeNode {
+// Private native borrows; callers hold the document lock until strings are copied.
+impl DocumentTypeNode {
     unsafe fn name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_document_type_name_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_document_type_name_noi) }
     }
 
     unsafe fn public_id_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_document_type_public_id_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_document_type_public_id_noi) }
     }
 
     unsafe fn system_id_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_document_type_system_id_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_document_type_system_id_noi) }
     }
+}
 
+impl DocumentType for DocumentTypeNode {
     #[inline]
     fn name(&self) -> Option<String> {
         check_node!(self);
@@ -472,7 +585,9 @@ impl Document for DocumentNode {
         })
     }
 
-    fn create_element(&mut self, local_name: &str) -> Result<ElementNode, DOMError> {
+    fn create_element(&self, local_name: &str) -> Result<ElementNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_element_unchecked(&self, local_name) }
         } else {
@@ -482,7 +597,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_document_fragment(&mut self) -> Result<DocumentFragmentNode, DOMError> {
+    fn create_document_fragment(&self) -> Result<DocumentFragmentNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_document_fragment_unchecked(&self) }
         } else {
@@ -492,7 +609,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_text_node(&mut self, data: &str) -> Result<TextNode, DOMError> {
+    fn create_text_node(&self, data: &str) -> Result<TextNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_text_node_unchecked(&self, data) }
         } else {
@@ -502,7 +621,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_cdata_section(&mut self, data: &str) -> Result<CdataSectionNode, DOMError> {
+    fn create_cdata_section(&self, data: &str) -> Result<CdataSectionNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_cdata_section_unchecked(&self, data) }
         } else {
@@ -512,7 +633,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_comment(&mut self, data: &str) -> Result<CommentNode, DOMError> {
+    fn create_comment(&self, data: &str) -> Result<CommentNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_comment_unchecked(&self, data) }
         } else {
@@ -522,11 +645,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_processing_instruction(
-        &mut self,
-        target: &str,
-        data: &str,
-    ) -> Result<ProcessingInstructionNode, DOMError> {
+    fn create_processing_instruction(&self, target: &str, data: &str) -> Result<ProcessingInstructionNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_processing_instruction_unchecked(&self, target, data) }
         } else {
@@ -536,7 +657,9 @@ impl Document for DocumentNode {
         }
     }
 
-    fn create_attribute(&mut self, local_name: &str) -> Result<AttrNode, DOMError> {
+    fn create_attribute(&self, local_name: &str) -> Result<AttrNode, DOMError> {
+        let document = self.tree_();
+        let _guard = document.doc_ptr();
         if !self.node_ptr_().is_null() {
             unsafe { create_attribute_unchecked(&self, local_name) }
         } else {
@@ -597,27 +720,23 @@ impl NonElementParentNode for DocumentFragmentNode {}
 
 define_node_type!(ElementNode, Element);
 
-impl Element for ElementNode {
+// Private native borrows; callers hold the document lock until strings are copied.
+impl ElementNode {
     /// DOM element tag or node name.
     unsafe fn tag_name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_element_tag_name) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_element_tag_name) }
     }
 
     unsafe fn local_name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_element_local_name) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_element_local_name) }
     }
 
     unsafe fn id_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_element_id_noi) }
-    }
-
-    #[inline]
-    unsafe fn name_unchecked(&self) -> Option<&str> {
-        unsafe { self.attribute_unchecked("name") }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_element_id_noi) }
     }
 
     unsafe fn class_name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_element_class_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_element_class_noi) }
     }
 
     unsafe fn attribute_unchecked(&self, qualified_name: &str) -> Option<&str> {
@@ -650,7 +769,9 @@ impl Element for ElementNode {
             name_vec
         }
     }
+}
 
+impl Element for ElementNode {
     /// DOM element tag or node name.
     #[inline]
     fn tag_name(&self) -> Option<String> {
@@ -671,7 +792,7 @@ impl Element for ElementNode {
     }
 
     #[inline]
-    fn set_id(&mut self, id: &str) {
+    fn set_id(&self, id: &str) {
         self.set_attribute("id", id);
     }
 
@@ -682,16 +803,12 @@ impl Element for ElementNode {
     }
 
     #[inline]
-    fn set_class_name(&mut self, class_name: &str) {
+    fn set_class_name(&self, class_name: &str) {
         self.set_attribute("class", class_name);
     }
 
     fn class_list(&self) -> DOMTokenList<'_> {
         DOMTokenList::new(self)
-    }
-
-    fn class_list_mut(&mut self) -> DOMTokenListMut<'_> {
-        DOMTokenListMut::new(self)
     }
 
     fn attribute(&self, qualified_name: &str) -> Option<String> {
@@ -733,6 +850,8 @@ impl Element for ElementNode {
     fn attributes(&self) -> NamedNodeMap {
         check_node!(self);
         NamedNodeMap::new_live(&self.as_noderef(), None, |n, _| {
+            let document = n.tree_();
+            let _guard = document.doc_ptr();
             let mut v = Vec::new();
             unsafe {
                 let mut attr = lxb_dom_element_first_attribute_noi(n.node_ptr_().cast());
@@ -745,9 +864,10 @@ impl Element for ElementNode {
         })
     }
 
-    fn set_attribute(&mut self, qualified_name: &str, value: &str) {
+    fn set_attribute(&self, qualified_name: &str, value: &str) {
         check_node!(self);
         unsafe {
+            self.tree_().mark_mutated();
             lxb_dom_element_set_attribute(
                 self.node_ptr_().cast(),
                 qualified_name.as_ptr(),
@@ -758,21 +878,23 @@ impl Element for ElementNode {
         }
     }
 
-    fn set_attribute_node(&mut self, attribute: &AttrNode) {
+    fn set_attribute_node(&self, attribute: &AttrNode) {
         check_nodes!(self, attribute);
         unsafe {
+            self.tree_().mark_mutated();
             lxb_dom_element_attr_append(self.node_ptr_().cast(), attribute.node_ptr_().cast());
         }
     }
 
-    fn remove_attribute(&mut self, qualified_name: &str) {
+    fn remove_attribute(&self, qualified_name: &str) {
         check_node!(self);
         unsafe {
+            self.tree_().mark_mutated();
             lxb_dom_element_remove_attribute(self.node_ptr_().cast(), qualified_name.as_ptr(), qualified_name.len());
         }
     }
 
-    fn toggle_attribute(&mut self, qualified_name: &str, force: Option<bool>) -> bool {
+    fn toggle_attribute(&self, qualified_name: &str, force: Option<bool>) -> bool {
         let on = match force {
             Some(f) => f,
             None => !self.has_attribute(qualified_name),
@@ -865,7 +987,7 @@ impl Element for ElementNode {
             if html_str.is_null() {
                 return String::default();
             }
-            let mut next = lxb_dom_node_first_child_noi(*self.node_ptr_());
+            let mut next = lxb_dom_node_first_child_noi(self.node_ptr_());
             while !next.is_null() {
                 lxb_html_serialize_tree_str(next, html_str);
                 next = lxb_dom_node_next_noi(next);
@@ -876,39 +998,67 @@ impl Element for ElementNode {
         }
     }
 
-    fn set_inner_html(&mut self, html: &str) {
+    fn set_inner_html(&self, html: &str) {
         check_node!(self);
         unsafe {
+            self.tree_().mark_mutated();
             lxb_html_element_inner_html_set(self.node_ptr_().cast(), html.as_ptr(), html.len());
         }
     }
 
     fn outer_html(&self) -> String {
         check_node!(self);
-        node_serialize_html(*self.node_ptr_())
+        node_serialize_html(self.node_ptr_())
     }
 
-    fn set_outer_html(&mut self, html: &str) {
+    fn set_outer_html(&self, html: &str) {
         check_node!(self);
-        if unsafe { *(*self.node_ptr_()) }.parent.is_null() {
+        let Some(parent) = self.parent_node() else {
             return;
-        }
-        self.set_inner_html(html);
+        };
+        let context = match parent {
+            Node::Element(element) => element,
+            Node::DocumentFragment(_) => {
+                let Some(document) = self.owner_document() else {
+                    return;
+                };
+                let Ok(body) = document.create_element("body") else {
+                    return;
+                };
+                body
+            }
+            // The document element cannot be replaced through outer HTML.
+            _ => return,
+        };
         unsafe {
-            self.iter_raw().for_each(|n| {
-                lxb_dom_node_insert_before(*self.node_ptr_(), n);
-            })
+            // Parse before modifying the existing tree, in the parent's context
+            // (important for table rows and other context-sensitive elements).
+            self.tree_().mark_mutated();
+            let fragment = lxb_html_document_parse_fragment(
+                self.doc_ptr_unchecked().cast(),
+                context.node_ptr_().cast(),
+                html.as_ptr(),
+                html.len(),
+            );
+            if fragment.is_null() {
+                return;
+            }
+            while !(*fragment).first_child.is_null() {
+                let child = (*fragment).first_child;
+                move_node_before_unchecked((*self.node_ptr_()).parent, child, self.node_ptr_());
+            }
+            lxb_dom_node_destroy(fragment);
         }
         self.remove()
     }
 
     fn inner_text(&self) -> String {
         check_node!(self);
-        node_format_visible_text(*self.node_ptr_())
+        node_format_visible_text(self.node_ptr_())
     }
 
     #[inline]
-    fn set_inner_text(&mut self, text: &str) {
+    fn set_inner_text(&self, text: &str) {
         self.set_text_content(text);
     }
 
@@ -917,13 +1067,16 @@ impl Element for ElementNode {
         self.inner_text()
     }
 
-    fn set_outer_text(&mut self, text: &str) {
+    fn set_outer_text(&self, text: &str) {
         check_node!(self);
+        if !matches!(self.parent_node(), Some(Node::Element(_) | Node::DocumentFragment(_))) {
+            return;
+        }
         self.set_text_content(text);
         unsafe {
-            let fc = lxb_dom_node_first_child_noi(*self.node_ptr_());
+            let fc = lxb_dom_node_first_child_noi(self.node_ptr_());
             if !fc.is_null() {
-                lxb_dom_node_insert_before(*self.node_ptr_(), fc);
+                move_node_before_unchecked((*self.node_ptr_()).parent, fc, self.node_ptr_());
             }
         }
         self.remove()
@@ -954,19 +1107,22 @@ impl NonDocumentTypeChildNode for ElementNode {}
 
 define_node_type!(AttrNode, Attribute);
 
-impl Attr for AttrNode {
+// Private native borrows; callers hold the document lock until strings are copied.
+impl AttrNode {
     unsafe fn name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_attr_qualified_name) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_attr_qualified_name) }
     }
 
     unsafe fn local_name_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_attr_local_name_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_attr_local_name_noi) }
     }
 
     unsafe fn value_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_attr_value_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_attr_value_noi) }
     }
+}
 
+impl Attr for AttrNode {
     #[inline]
     fn local_name(&self) -> Option<String> {
         check_node!(self);
@@ -985,17 +1141,18 @@ impl Attr for AttrNode {
         unsafe { Some(self.value_unchecked()?.to_owned()) }
     }
 
-    fn set_value(&mut self, value: &str) {
+    fn set_value(&self, value: &str) {
         check_node!(self);
         unsafe {
-            lxb_dom_node_text_content_set(*self.node_ptr_(), value.as_ptr(), value.len());
+            self.tree_().mark_mutated();
+            lxb_dom_node_text_content_set(self.node_ptr_(), value.as_ptr(), value.len());
         }
     }
 
     fn owner_element(&self) -> Option<ElementNode> {
         check_node!(self);
         unsafe {
-            let attr = (*self.node_ptr_()) as *mut lxb_dom_attr_t;
+            let attr = (self.node_ptr_()) as *mut lxb_dom_attr_t;
             if attr.is_null() || (*attr).owner.is_null() {
                 return None;
             }
@@ -1035,7 +1192,7 @@ define_node_type!(ProcessingInstructionNode, ProcessingInstruction);
 impl ProcessingInstruction for ProcessingInstructionNode {
     fn target(&self) -> Option<String> {
         check_node!(self);
-        unsafe { Some(str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_processing_instruction_target_noi)?.to_owned()) }
+        unsafe { Some(str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_processing_instruction_target_noi)?.to_owned()) }
     }
 }
 
@@ -1062,15 +1219,18 @@ impl NonDocumentTypeChildNode for CommentNode {}
 define_node_type!(NotationNode, Notation);
 
 //noinspection DuplicatedCode
-impl Notation for NotationNode {
+// Private native borrows; callers hold the document lock until strings are copied.
+impl NotationNode {
     unsafe fn public_id_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_document_type_public_id_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_document_type_public_id_noi) }
     }
 
     unsafe fn system_id_unchecked(&self) -> Option<&str> {
-        unsafe { str_from_lxb_str_cb(*self.node_ptr_(), lxb_dom_document_type_system_id_noi) }
+        unsafe { str_from_lxb_str_cb(self.node_ptr_(), lxb_dom_document_type_system_id_noi) }
     }
+}
 
+impl Notation for NotationNode {
     #[inline]
     fn public_id(&self) -> Option<String> {
         check_node!(self);

@@ -18,7 +18,7 @@ use pyo3::prelude::*;
 use pyo3::types::*;
 use resiliparse::parse::html::tree as tree_impl;
 
-#[pyclass(module = "resiliparse.parse._html_rs")]
+#[pyclass(unsendable, module = "resiliparse.parse._html_rs")]
 pub struct HTMLTree {
     tree: tree_impl::HTMLTree,
 }
@@ -46,14 +46,14 @@ impl HTMLTree {
     pub fn create_element<'py>(slf: PyRef<'py, Self>, tag_name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
         Self::document(slf).map_or_else(
             || Err(DOMException::new_err("No document node.")),
-            |d| DocumentNode::create_element(d.borrow_mut(), tag_name),
+            |d| DocumentNode::create_element(d.borrow(), tag_name),
         )
     }
 
     pub fn create_text_node<'py>(slf: PyRef<'py, Self>, text: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
         Self::document(slf).map_or_else(
             || Err(DOMException::new_err("No document node.")),
-            |d| DocumentNode::create_text_node(d.borrow_mut(), text),
+            |d| DocumentNode::create_text_node(d.borrow(), text),
         )
     }
 

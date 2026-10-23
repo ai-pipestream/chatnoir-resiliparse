@@ -46,6 +46,7 @@ impl Error for DOMError {}
 // -------------------------------------- Crate-public Helpers -------------------------------------
 
 pub(crate) fn wrap_any_raw_node(tree: &Arc<HTMLDocument>, node: *mut lxb_dom_node_t) -> Option<Node> {
+    let _guard = tree.doc_ptr();
     match unsafe { node.as_ref()?.type_ } {
         LXB_DOM_NODE_TYPE_ELEMENT => Some(Node::Element(ElementNode::new(tree, node))),
         LXB_DOM_NODE_TYPE_ATTRIBUTE => Some(Node::Attribute(AttrNode::new(tree, node))),
@@ -64,6 +65,28 @@ pub(crate) fn wrap_any_raw_node(tree: &Arc<HTMLDocument>, node: *mut lxb_dom_nod
 }
 
 // ----------------------------------------- Private Helpers ---------------------------------------
+
+/// Move a node after validation by the caller.
+///
+/// The document lock must be held and its mutation counter updated. All pointers
+/// must be valid, belong to the same document, and describe an acyclic insertion;
+/// a non-null reference must be a child of `parent` and distinct from `node`.
+unsafe fn move_node_before_unchecked(
+    parent: *mut lxb_dom_node_t,
+    node: *mut lxb_dom_node_t,
+    reference: *mut lxb_dom_node_t,
+) {
+    unsafe {
+        // Lexbor's insertion functions do not detach nodes. Always repair the
+        // previous parent's first/last child and the old siblings' links first.
+        lxb_dom_node_remove(node);
+        if reference.is_null() {
+            lxb_dom_node_insert_child(parent, node);
+        } else {
+            lxb_dom_node_insert_before(reference, node);
+        }
+    }
+}
 
 unsafe fn next_element_unchecked(tree: &Arc<HTMLDocument>, mut child: *mut lxb_dom_node_t) -> Option<ElementNode> {
     unsafe {
@@ -196,13 +219,15 @@ unsafe fn create_attribute_unchecked(doc: &DocumentNode, local_name: &str) -> Re
 }
 
 unsafe fn get_element_by_id(node: &NodeRef, id: &str, case_insensitive: bool) -> Option<ElementNode> {
+    let document = node.tree_();
+    let _guard = document.doc_ptr();
     unsafe {
         let coll = lxb_dom_collection_create(node.doc_ptr_unchecked());
         if coll.is_null() {
             return None;
         }
         lxb_dom_elements_by_attr(
-            *node.node_ptr_() as *mut lxb_dom_element_t,
+            node.node_ptr_() as *mut lxb_dom_element_t,
             coll,
             "id".as_ptr(),
             2,
@@ -221,13 +246,15 @@ unsafe fn get_element_by_id(node: &NodeRef, id: &str, case_insensitive: bool) ->
 }
 
 unsafe fn get_elements_by_attr(node: &NodeRef, name: &str, value: &str, case_insensitive: bool) -> Vec<ElementNode> {
+    let document = node.tree_();
+    let _guard = document.doc_ptr();
     unsafe {
         let coll = lxb_dom_collection_create(node.doc_ptr_unchecked());
         if coll.is_null() {
             return Vec::default();
         }
         lxb_dom_elements_by_attr(
-            *node.node_ptr_() as *mut lxb_dom_element_t,
+            node.node_ptr_() as *mut lxb_dom_element_t,
             coll,
             name.as_ptr(),
             name.len(),
@@ -240,17 +267,21 @@ unsafe fn get_elements_by_attr(node: &NodeRef, name: &str, value: &str, case_ins
 }
 
 unsafe fn get_elements_by_tag_name(node: &Node, name: &str) -> Vec<ElementNode> {
+    let document = node.tree_();
+    let _guard = document.doc_ptr();
     unsafe {
         let coll = lxb_dom_collection_create(node.doc_ptr_unchecked());
         if coll.is_null() {
             return Vec::default();
         }
-        lxb_dom_node_by_tag_name(*node.node_ptr_(), coll, name.as_ptr(), name.len());
+        lxb_dom_node_by_tag_name(node.node_ptr_(), coll, name.as_ptr(), name.len());
         dom_coll_to_vec(&node.tree_(), coll, true)
     }
 }
 
 unsafe fn get_elements_by_class_name(node: &Node, class_names: &str) -> Vec<ElementNode> {
+    let document = node.tree_();
+    let _guard = document.doc_ptr();
     unsafe {
         let coll = lxb_dom_collection_create(node.doc_ptr_unchecked());
         if coll.is_null() {

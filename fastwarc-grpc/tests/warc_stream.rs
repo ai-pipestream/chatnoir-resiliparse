@@ -18,6 +18,7 @@
 
 mod common;
 
+use rstest::rstest;
 use std::io::Read;
 
 use common::{RecordOutcome, collect_warc, data_path, direct_options, group_responses, records_only};
@@ -80,25 +81,27 @@ async fn parse_http_defaults_true() {
 
 /// Gzip-, lz4-, and zstd-compressed input is detected transparently from magic
 /// bytes (odd chunk size stresses reassembly across channel boundaries).
+#[rstest]
+#[case::gzip("warcfile.warc.gz")]
+#[case::lz4("warcfile.warc.lz4")]
+#[case::zstd("warcfile.warc.zst")]
 #[tokio::test]
-async fn stream_warcfile_compressed() {
-    for file in ["warcfile.warc.gz", "warcfile.warc.lz4", "warcfile.warc.zst"] {
-        let config = default_config();
-        let responses = collect_warc(file, 997, &config).await;
-        let outcomes = group_responses(&responses);
-        assert!(
-            outcomes.iter().all(|o| matches!(o, RecordOutcome::Record { .. })),
-            "unexpected record_error for {file}"
-        );
+async fn stream_warcfile_compressed(#[case] file: &str) {
+    let config = default_config();
+    let responses = collect_warc(file, 997, &config).await;
+    let outcomes = group_responses(&responses);
+    assert!(
+        outcomes.iter().all(|o| matches!(o, RecordOutcome::Record { .. })),
+        "unexpected record_error for {file}"
+    );
 
-        let direct_types = direct_record_types(file, &config);
-        assert_eq!(outcomes.len(), direct_types.len(), "record count mismatch for {file}");
-        for (outcome, expected_type) in outcomes.iter().zip(&direct_types) {
-            let RecordOutcome::Record { metadata, .. } = outcome else {
-                unreachable!();
-            };
-            assert_eq!(metadata.record_type, *expected_type as i32);
-        }
+    let direct_types = direct_record_types(file, &config);
+    assert_eq!(outcomes.len(), direct_types.len(), "record count mismatch for {file}");
+    for (outcome, expected_type) in outcomes.iter().zip(&direct_types) {
+        let RecordOutcome::Record { metadata, .. } = outcome else {
+            unreachable!();
+        };
+        assert_eq!(metadata.record_type, *expected_type as i32);
     }
 }
 
@@ -662,34 +665,20 @@ async fn excessive_header_limit_is_rejected() {
 
 /// Client-controlled allocation and response sizes are rejected before the
 /// parser task starts.
+#[rstest]
+#[case::payload_chunk(pb::ParseWarcConfig { payload_chunk_size: (8 << 20) + 1, ..Default::default() })]
+#[case::input_buffer(pb::ParseWarcConfig { input_buffer_size: (16 << 20) + 1, ..Default::default() })]
+#[case::inverted_lengths(pb::ParseWarcConfig { min_content_length: Some(2), max_content_length: Some(1), ..Default::default() })]
 #[tokio::test]
-async fn excessive_buffer_and_chunk_limits_are_rejected() {
-    let configs = [
-        pb::ParseWarcConfig {
-            payload_chunk_size: (8 << 20) + 1,
-            ..Default::default()
-        },
-        pb::ParseWarcConfig {
-            input_buffer_size: (16 << 20) + 1,
-            ..Default::default()
-        },
-        pb::ParseWarcConfig {
-            min_content_length: Some(2),
-            max_content_length: Some(1),
-            ..Default::default()
-        },
-    ];
-
-    for config in configs {
-        let mut client = common::warc_client().await;
-        let error = client
-            .parse_warc(tokio_stream::iter([pb::ParseWarcRequest {
-                kind: Some(pb::parse_warc_request::Kind::Config(config)),
-            }]))
-            .await
-            .unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    }
+async fn excessive_buffer_and_chunk_limits_are_rejected(#[case] config: pb::ParseWarcConfig) {
+    let mut client = common::warc_client().await;
+    let error = client
+        .parse_warc(tokio_stream::iter([pb::ParseWarcRequest {
+            kind: Some(pb::parse_warc_request::Kind::Config(config)),
+        }]))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
 }
 
 /// `record_types` filter keeps only the requested types (Python parity).
@@ -817,35 +806,36 @@ async fn stream_block_sized_records() {
 /// The unary `ParseArchive` must return exactly what a folded `ParseWarc`
 /// stream yields for the same input and config: same records in order, same
 /// metadata and same payload bytes. Exercised on plain and gzip input.
+#[rstest]
+#[case::plain("warcfile.warc")]
+#[case::gzip("warcfile.warc.gz")]
 #[tokio::test]
-async fn unary_matches_stream() {
-    for file in ["warcfile.warc", "warcfile.warc.gz"] {
-        let config = pb::ParseWarcConfig {
-            parse_http: Some(true),
-            verify_digests: true,
-            ..Default::default()
-        };
-        let responses = collect_warc(file, 8 << 10, &config).await;
-        let outcomes = group_responses(&responses);
-        let streamed = records_only(&outcomes);
+async fn unary_matches_stream(#[case] file: &str) {
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(true),
+        verify_digests: true,
+        ..Default::default()
+    };
+    let responses = collect_warc(file, 8 << 10, &config).await;
+    let outcomes = group_responses(&responses);
+    let streamed = records_only(&outcomes);
 
-        let mut client = common::warc_client().await;
-        let unary = client
-            .parse_archive(pb::ParseArchiveRequest {
-                config: Some(config),
-                archive: std::fs::read(data_path(file)).unwrap().into(),
-            })
-            .await
-            .unwrap()
-            .into_inner();
+    let mut client = common::warc_client().await;
+    let unary = client
+        .parse_archive(pb::ParseArchiveRequest {
+            config: Some(config),
+            archive: std::fs::read(data_path(file)).unwrap().into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
 
-        assert!(unary.errors.is_empty(), "unexpected errors for {file}");
-        assert_eq!(unary.records.len(), streamed.len(), "record count mismatch for {file}");
-        for (record, (metadata, payload, end)) in unary.records.iter().zip(&streamed) {
-            assert_eq!(record.metadata.as_ref().unwrap(), *metadata);
-            assert_eq!(record.payload.as_slice(), *payload);
-            assert_eq!(record.payload.len(), usize::try_from(end.payload_length).unwrap());
-        }
+    assert!(unary.errors.is_empty(), "unexpected errors for {file}");
+    assert_eq!(unary.records.len(), streamed.len(), "record count mismatch for {file}");
+    for (record, (metadata, payload, end)) in unary.records.iter().zip(&streamed) {
+        assert_eq!(record.metadata.as_ref().unwrap(), *metadata);
+        assert_eq!(record.payload.as_slice(), *payload);
+        assert_eq!(record.payload.len(), usize::try_from(end.payload_length).unwrap());
     }
 }
 
@@ -1377,4 +1367,131 @@ async fn record_end_length_reflects_http_header_stripping() {
     });
     assert_eq!(payload_length, Some(4), "payload_length should be the HTTP-stripped body length");
     assert_eq!(content_length, Some(4));
+}
+
+/// Batched record events are flushed when the upload stream goes idle.
+#[tokio::test]
+async fn batched_record_delivered_while_upload_idle() {
+    let record = b"WARC/1.0\r\nWARC-Type: resource\r\nWARC-Record-ID: <urn:uuid:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa>\r\nWARC-Date: 2020-01-01T00:00:00Z\r\nContent-Length: 4\r\n\r\nbody\r\n\r\n";
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(false),
+        response_batch_size: 64,
+        ..Default::default()
+    };
+    let mut client = common::warc_client().await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel::<pb::ParseWarcRequest>(4);
+    for request in common::warc_requests(record, record.len(), &config) {
+        req_tx.send(request).await.unwrap();
+    }
+    let mut stream = client
+        .parse_warc(tokio_stream::wrappers::ReceiverStream::new(req_rx))
+        .await
+        .unwrap()
+        .into_inner();
+
+    let first = tokio::time::timeout(std::time::Duration::from_secs(10), stream.message())
+        .await
+        .expect("batched events were withheld while the parser waited for more input")
+        .unwrap()
+        .unwrap();
+    let mut events = Vec::new();
+    common::for_each_event(std::slice::from_ref(&first), |event| events.push(event.clone()));
+    assert!(
+        matches!(events.last().and_then(|e| e.kind.as_ref()), Some(pb::parse_warc_response::Kind::RecordEnd(_))),
+        "expected the complete record sequence, got {events:?}"
+    );
+
+    drop(req_tx);
+    while stream.message().await.unwrap().is_some() {}
+}
+
+/// Partial payload chunks are flushed when the upload stream goes idle.
+#[rstest]
+#[case::plain(false, false)]
+#[case::gzip(false, true)]
+#[case::http(true, false)]
+#[tokio::test]
+async fn partial_payload_delivered_while_upload_idle(
+    #[values(0, 64)] response_batch_size: u32,
+    #[case] http: bool,
+    #[case] gzip: bool,
+) {
+    use std::io::Write;
+
+    let payload = vec![b'x'; 128 << 10];
+    let (record_type, http_headers) = if http {
+        ("response", format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", payload.len()))
+    } else {
+        ("resource", String::new())
+    };
+    let content_type = if http { "Content-Type: application/http\r\n" } else { "" };
+    let mut prefix = format!(
+        "WARC/1.0\r\nWARC-Type: {record_type}\r\n{content_type}Content-Length: {}\r\n\r\n{http_headers}",
+        http_headers.len() + payload.len()
+    )
+    .into_bytes();
+    prefix.extend_from_slice(&payload[..8 << 10]);
+    let mut rest = payload[8 << 10..].to_vec();
+    rest.extend_from_slice(b"\r\n\r\n");
+    if gzip {
+        for part in [&mut prefix, &mut rest] {
+            let mut writer = fastwarc::stream_io::gzip::GzipWriter::new(Vec::new());
+            writer.write_all(part).unwrap();
+            *part = writer.into_inner().unwrap();
+        }
+    }
+    let config = pb::ParseWarcConfig {
+        parse_http: Some(http),
+        payload_chunk_size: 64 << 10,
+        response_batch_size,
+        ..Default::default()
+    };
+    let mut client = common::warc_client().await;
+    let (req_tx, req_rx) = tokio::sync::mpsc::channel(4);
+    for request in common::warc_requests(&prefix, prefix.len(), &config) {
+        req_tx.send(request).await.unwrap();
+    }
+    let mut stream = client
+        .parse_warc(tokio_stream::wrappers::ReceiverStream::new(req_rx))
+        .await
+        .unwrap()
+        .into_inner();
+    let mut responses = Vec::new();
+    let mut payload_bytes = 0;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while payload_bytes < 8 << 10 {
+            let response = stream.message().await.unwrap().unwrap();
+            common::for_each_event(std::slice::from_ref(&response), |event| {
+                if let Some(pb::parse_warc_response::Kind::PayloadChunk(chunk)) = &event.kind {
+                    payload_bytes += chunk.data.len();
+                }
+            });
+            responses.push(response);
+        }
+    })
+    .await
+    .expect("partial payload was withheld while waiting for more upload input");
+    assert_eq!(payload_bytes, 8 << 10);
+
+    req_tx
+        .send(pb::ParseWarcRequest {
+            kind: Some(pb::parse_warc_request::Kind::Chunk(rest.into())),
+        })
+        .await
+        .unwrap();
+    drop(req_tx);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        while let Some(response) = stream.message().await.unwrap() {
+            responses.push(response);
+        }
+    })
+    .await
+    .expect("parser failed to finish after upload was closed");
+
+    let outcomes = group_responses(&responses);
+    let records = records_only(&outcomes);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].1, payload);
+    assert_eq!(records[0].2.payload_length, payload.len() as u64);
+    assert_eq!(records[0].0.http_parsed, http);
 }

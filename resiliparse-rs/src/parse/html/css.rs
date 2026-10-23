@@ -22,7 +22,6 @@ use std::ptr::addr_of_mut;
 use std::sync::{Arc, Weak};
 
 use crate::parse::html::dom::node::{ElementNode, NodeRef};
-use crate::parse::html::dom::traits::NodeInterfaceBaseImpl;
 use crate::parse::html::lexbor::*;
 use crate::parse::html::tree::HTMLDocument;
 use crate::third_party::lexbor::lexbor_status_t::*;
@@ -66,6 +65,7 @@ impl<'a> CSSSelectorList<'a> {
         tree: &Arc<HTMLDocument>,
         selectors: &str,
     ) -> Result<CSSSelectorList<'a>, CSSParserError> {
+        let _guard = tree.doc_ptr();
         unsafe {
             if lxb_html_document_css_init(*tree.doc_ptr()) != LXB_HTML_STATUS_OK {
                 return Err(CSSParserError {
@@ -112,6 +112,7 @@ impl<'a> CSSSelectorList<'a> {
     ) {
         unsafe {
             if let Some(t) = self.tree.upgrade() {
+                let _guard = t.doc_ptr();
                 lxb_selectors_find(
                     (*(*t.doc_ptr())).css.selectors,
                     root_node,
@@ -131,6 +132,7 @@ impl<'a> CSSSelectorList<'a> {
     ) {
         unsafe {
             if let Some(t) = self.tree.upgrade() {
+                let _guard = t.doc_ptr();
                 lxb_selectors_find_reverse(
                     (*(*t.doc_ptr())).css.selectors,
                     node,
@@ -171,6 +173,7 @@ impl<'a> CSSSelectorList<'a> {
         F: Fn(ElementNode, u32, &mut T) -> TraverseAction,
     {
         let tree = self.tree.upgrade().unwrap();
+        let _guard = tree.doc_ptr();
         assert_eq!(*tree.doc_ptr(), *root_node.tree_().doc_ptr());
         let mut ctx_wrapper = MatchContextWrapper {
             f: cb,
@@ -178,11 +181,7 @@ impl<'a> CSSSelectorList<'a> {
             custom_data,
         };
         unsafe {
-            self.match_elements_unchecked(
-                *root_node.node_ptr_(),
-                Some(Self::match_cb_adapter::<T, F>),
-                &mut ctx_wrapper,
-            )
+            self.match_elements_unchecked(root_node.node_ptr_(), Some(Self::match_cb_adapter::<T, F>), &mut ctx_wrapper)
         }
     }
 
@@ -190,12 +189,13 @@ impl<'a> CSSSelectorList<'a> {
     where
         F: Fn(ElementNode, u32, &mut T) -> TraverseAction,
     {
+        let tree = self.tree.upgrade().unwrap();
+        let _guard = tree.doc_ptr();
         unsafe {
-            if (*(*node.node_ptr_())).parent.is_null() || (*(*node.node_ptr_())).type_ != LXB_DOM_NODE_TYPE_ELEMENT {
+            if (*node.node_ptr_()).parent.is_null() || (*node.node_ptr_()).type_ != LXB_DOM_NODE_TYPE_ELEMENT {
                 return;
             }
         }
-        let tree = self.tree.upgrade().unwrap();
         assert_eq!(*tree.doc_ptr(), *node.tree_().doc_ptr());
         let mut ctx_wrapper = MatchContextWrapper {
             f: cb,
@@ -204,7 +204,7 @@ impl<'a> CSSSelectorList<'a> {
         };
         unsafe {
             self.match_elements_unchecked_reverse(
-                *node.node_ptr_(),
+                node.node_ptr_(),
                 Some(Self::match_cb_adapter::<T, F>),
                 &mut ctx_wrapper,
             )
@@ -214,6 +214,8 @@ impl<'a> CSSSelectorList<'a> {
 
 impl Drop for CSSSelectorList<'_> {
     fn drop(&mut self) {
+        let tree = self.tree.upgrade();
+        let _guard = tree.as_ref().map(|tree| tree.doc_ptr());
         unsafe {
             lxb_css_selector_list_destroy(self.selector_list);
         }
